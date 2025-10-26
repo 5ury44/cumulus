@@ -149,11 +149,45 @@ class CodeExecutor:
             env['CUMULUS_JOB_ID'] = job_id
             env['CUMULUS_JOB_DIR'] = job_dir  # Add job directory for checkpointing
             
+            # Set up S3 distributed checkpointing environment
+            self._setup_s3_environment(env)
+            
             # Execute with Cumulus context
             return await self.execute_code(job_dir, job_id, env)
             
         except Exception as e:
             raise RuntimeError(f"Cumulus execution failed: {str(e)}")
+    
+    def _setup_s3_environment(self, env: dict):
+        """
+        Setup S3 environment variables for distributed checkpointing.
+        """
+        # Default S3 configuration (can be overridden by environment)
+        s3_config = {
+            'CUMULUS_S3_BUCKET': 'cumulus-jobs',
+            'CUMULUS_S3_REGION': 'us-east-1',
+            'AWS_ACCESS_KEY_ID': '',
+            'AWS_SECRET_ACCESS_KEY': '',
+            'CUMULUS_LOCAL_CACHE_DIR': '/tmp/cumulus/checkpoints',
+            'CUMULUS_CACHE_SIZE_LIMIT_GB': '10.0',
+            'CUMULUS_KEEP_CHECKPOINTS': '5',
+            'CUMULUS_CHECKPOINT_EVERY_STEPS': '100',
+            'CUMULUS_CHECKPOINT_EVERY_SECONDS': '300',
+            'CUMULUS_AUTO_CLEANUP': 'true',
+            'CUMULUS_ENABLE_JOB_METADATA': 'true',
+            'CUMULUS_METADATA_TTL_SECONDS': '86400'
+        }
+        
+        # Set environment variables if not already set
+        for key, value in s3_config.items():
+            if key not in env:
+                env[key] = value
+        
+        print(f"🔧 S3 Environment configured:")
+        print(f"  📦 S3 Bucket: {env.get('CUMULUS_S3_BUCKET')}")
+        print(f"  🌍 S3 Region: {env.get('CUMULUS_S3_REGION')}")
+        print(f"  💾 Local Cache: {env.get('CUMULUS_LOCAL_CACHE_DIR')}")
+        print(f"  🔑 AWS Access Key: {'Configured' if env.get('AWS_ACCESS_KEY_ID') else 'Not configured'}")
 
 
 class IsolatedExecutor(CodeExecutor):

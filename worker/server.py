@@ -18,6 +18,14 @@ from pydantic import BaseModel
 from .executor import CodeExecutor
 from .cumulus_manager import CumulusManager
 
+# Load environment variables for distributed checkpointing
+try:
+    from ..sdk.env_loader import setup_distributed_checkpointing_env
+    setup_distributed_checkpointing_env()
+except ImportError:
+    # Fallback to manual environment setup
+    pass
+
 
 # Pydantic models
 class JobSubmission(BaseModel):
@@ -322,7 +330,7 @@ async def execute_job(job_id: str, code_data: bytes, gpu_memory: float, duration
         job.partition_id = partition_id
         
         # Execute code
-        result = await executor.execute_code(job_dir, job_id)
+        result = await executor.execute_with_cumulus(job_dir, job_id, partition_id)
         
         # Save result
         result_path = os.path.join(job_dir, "result.json")

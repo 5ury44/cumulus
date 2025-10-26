@@ -8,6 +8,13 @@ import time
 import torch
 from typing import Dict, Any, Optional, List
 
+# Import distributed checkpointing if available
+try:
+    from .distributed_checkpointer import DistributedCheckpointer, create_distributed_checkpointer
+    DISTRIBUTED_CHECKPOINTING_AVAILABLE = True
+except ImportError:
+    DISTRIBUTED_CHECKPOINTING_AVAILABLE = False
+
 
 def job_dir():
     """Get the job directory from environment variable."""
@@ -95,3 +102,79 @@ def list_checkpoints() -> List[Dict[str, Any]]:
                 continue
     
     return sorted(checkpoints, key=lambda x: x['timestamp'], reverse=True)
+
+
+def get_distributed_checkpointer(job_id: str = None, **kwargs) -> Optional[DistributedCheckpointer]:
+    """
+    Get a distributed checkpointer instance if available and configured.
+    
+    Args:
+        job_id: Job ID (defaults to CUMULUS_JOB_ID env var)
+        **kwargs: Additional arguments for DistributedCheckpointer
+        
+    Returns:
+        DistributedCheckpointer instance or None if not available/configured
+    """
+    if not DISTRIBUTED_CHECKPOINTING_AVAILABLE:
+        return None
+    
+    # Get job ID from environment if not provided
+    if job_id is None:
+        job_id = os.getenv('CUMULUS_JOB_ID')
+        if not job_id:
+            return None
+    
+    # Check if S3 is configured
+    s3_bucket = os.getenv('CUMULUS_S3_BUCKET')
+    if not s3_bucket:
+        return None
+    
+    try:
+        return create_distributed_checkpointer(job_id, **kwargs)
+    except Exception as e:
+        print(f"Warning: Failed to create distributed checkpointer: {e}")
+        return None
+
+
+def get_checkpointer(job_id: str = None, use_distributed: bool = True, **kwargs):
+    """
+    Get the appropriate checkpointer (distributed or local).
+    
+    Args:
+        job_id: Job ID for distributed checkpointing
+        use_distributed: Whether to prefer distributed checkpointing
+        **kwargs: Additional arguments for checkpointers
+        
+    Returns:
+        Checkpointer instance (DistributedCheckpointer or Checkpointer)
+    """
+    if use_distributed:
+        distributed_ckpt = get_distributed_checkpointer(job_id, **kwargs)
+        if distributed_ckpt:
+            return distributed_ckpt
+    
+    # Fall back to local checkpointer
+    return Checkpointer()
+
+
+# Convenience functions for backward compatibility
+def save_checkpoint(model, optimizer, epoch: int, step: int, extra: dict = None, **kwargs):
+    """Save checkpoint using the appropriate checkpointer."""
+    checkpointer = get_checkpointer(**kwargs)
+    return checkpointer.save(model, optimizer, epoch, step, extra)
+
+
+def load_checkpoint(model, optimizer, checkpoint_path: str = None, **kwargs):
+    """Load checkpoint using the appropriate checkpointer."""
+    checkpointer = get_checkpointer(**kwargs)
+    return checkpointer.load(model, optimizer, checkpoint_path)
+
+
+def find_latest_checkpoint(**kwargs):
+    """Find the latest checkpoint using the appropriate checkpointer."""
+    checkpointer = get_checkpointer(**kwargs)
+    if hasattr(checkpointer, 'find_latest_checkpoint'):
+        return checkpointer.find_latest_checkpoint()
+    elif hasattr(checkpointer, 'exists') and checkpointer.exists():
+        return checkpointer.path
+    return None
