@@ -20,12 +20,15 @@ A distributed execution system that sends code to remote GPU servers with Cumulu
 ### 1. Setup Remote Server
 
 ```bash
-# On your GPU server
-cd /path/to/chronos
-./install-chronos-gpu.sh
+# On your GPU server (clean install)
+python3 -m venv cumulus-env && source cumulus-env/bin/activate
+pip install -e .
+
+# Option A: build vendored Chronos and let cumulus discover it
+#   (see cumulus/chronos_vendor/README.md)
 
 # Start the worker
-python3 cumulus/worker/server.py --host 0.0.0.0 --port 8080
+cumulus-cli serve --host 0.0.0.0 --port 8080
 ```
 
 ### 2. Use Local SDK

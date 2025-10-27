@@ -1,0 +1,20 @@
+--- a/src/partitioner.cpp
++++ b/src/partitioner.cpp
+@@ -154,7 +154,15 @@ void ChronosPartitioner::Impl::initializeDevices() {
+         return;
+     }
+ 
+-    platform = platforms[0];
++    platform = platforms[0];
++    // Prefer GPU platform over CPU platform
++    for (cl_uint i = 0; i < numPlatforms; i++) {
++        cl_uint numDevices;
++        err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, 0, nullptr, &numDevices);
++        if (err == CL_SUCCESS && numDevices > 0) {
++            platform = platforms[i];
++            break;
++        }
++    }
+ 
+     cl_uint numDevices;
+     err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 0, nullptr, &numDevices);

@@ -58,7 +58,8 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "cumulus-worker=cumulus.worker.server:main",
+            "cumulus-cli=cumulus.cli:main",
+            "cumulus-worker=cumulus.start_worker:main",
         ],
     },
     include_package_data=True,

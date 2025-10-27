@@ -34,12 +34,13 @@ This guide walks you through setting up the complete Cumulus distributed executi
 ### 1. Install Cumulus on Remote Server
 
 ```bash
-# On your GPU server
-cd /path/to/chronos
-./install-chronos-gpu.sh
+# On your GPU server (clean machine)
+python3 -m venv cumulus-env
+source cumulus-env/bin/activate
+pip install -e .
 
-# Verify Cumulus is working
-chronos_cli stats
+# Build vendored Chronos (recommended) or ensure system chronos_cli is available
+# See cumulus/chronos_vendor/README.md for build steps
 ```
 
 ### 2. Install Cumulus Worker on Remote Server
@@ -50,7 +51,7 @@ cd /path/to/cumulus
 pip install -e .
 
 # Start the worker server
-python start_worker.py --host 0.0.0.0 --port 8080
+cumulus-cli serve --host 0.0.0.0 --port 8080
 ```
 
 ### 3. Install Cumulus SDK on Local Machine
@@ -107,10 +108,10 @@ sudo mkdir -p /tmp/cumulus_jobs
 sudo chmod 777 /tmp/cumulus_jobs
 
 # Start worker server
-python start_worker.py --host 0.0.0.0 --port 8080 --workers 4
+cumulus-cli serve --host 0.0.0.0 --port 8080 --workers 4
 
 # Or run in background
-nohup python start_worker.py --host 0.0.0.0 --port 8080 > worker.log 2>&1 &
+nohup cumulus-cli serve --host 0.0.0.0 --port 8080 > worker.log 2>&1 &
 ```
 
 #### Step 4: Verify Worker is Running
@@ -272,9 +273,9 @@ for job in jobs:
 # Check worker logs
 tail -f worker.log
 
-# Check Cumulus status
-chronos_cli stats
-chronos_cli list
+# Check Chronos status (vendored)
+cumulus-cli chronos stats
+cumulus-cli chronos list
 
 # Check job directories
 ls -la /tmp/cumulus_jobs/
@@ -287,7 +288,7 @@ ls -la /tmp/cumulus_jobs/
 ```bash
 # Worker configuration
 export MAX_CONCURRENT_JOBS=5
-export CHRONOS_PATH="/usr/local/bin/chronos_cli"
+export CUMULUS_CHRONOS_PATH="/path/to/chronos_cli"  # optional override
 export JOB_TIMEOUT=3600
 
 # Client configuration
@@ -306,7 +307,7 @@ server:
   workers: 4
 
 chronos:
-  path: "/usr/local/bin/chronos_cli"
+  path: "/usr/local/bin/chronos_cli" # or leave blank and use vendored
   default_device: 0
   max_memory_fraction: 0.95
 
@@ -340,9 +341,8 @@ sudo ufw status
 #### 2. Cumulus Not Found
 
 ```bash
-# Check Cumulus installation
-which chronos_cli
-chronos_cli stats
+# Check Chronos resolution
+cumulus-cli chronos-path
 
 # Check library path
 export LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH"

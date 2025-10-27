@@ -7,6 +7,8 @@ import json
 import time
 from typing import List, Dict, Optional, Any
 import os
+import sys
+from pathlib import Path
 
 
 class CumulusManager:
@@ -15,9 +17,40 @@ class CumulusManager:
     """
     
     def __init__(self, cumulus_path: str = "/usr/local/bin/chronos_cli"):
-        self.cumulus_path = cumulus_path
+        # Allow override from environment or vendored binary
+        self.cumulus_path = self._resolve_chronos_cli_path(cumulus_path)
         self.available = self._check_cumulus_availability()
         self.active_partitions: Dict[str, Dict] = {}
+
+    def _resolve_chronos_cli_path(self, default_path: str) -> str:
+        """Resolve the chronos_cli path from env or vendored locations.
+
+        Priority:
+        1) CUMULUS_CHRONOS_PATH env var
+        2) Vendored binary under cumulus/chronos_vendor/bin/chronos_cli
+        3) Provided default_path (usually system path)
+        """
+        # 1) Env override
+        env_path = os.getenv("CUMULUS_CHRONOS_PATH")
+        if env_path and os.path.isfile(env_path) and os.access(env_path, os.X_OK):
+            return env_path
+
+        # 2) Vendored path relative to this file
+        try:
+            # Locate package root: cumulus/worker/ -> cumulus/
+            pkg_root = Path(__file__).resolve().parent.parent
+            candidates = [
+                pkg_root / "chronos_vendor" / "bin" / "chronos_cli",
+                pkg_root / "chronos_vendor" / "build" / "chronos_cli",
+            ]
+            for cand in candidates:
+                if cand.is_file() and os.access(str(cand), os.X_OK):
+                    return str(cand)
+        except Exception:
+            pass
+
+        # 3) Fallback to default
+        return default_path
     
     def _check_cumulus_availability(self) -> bool:
         """Check if Cumulus is available and working."""
