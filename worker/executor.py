@@ -161,9 +161,27 @@ class CodeExecutor:
     def _setup_s3_environment(self, env: dict):
         """
         Setup S3 environment variables for distributed checkpointing.
+        Loads from .env file on server if available.
         """
-        # Default S3 configuration (can be overridden by environment)
-        s3_config = {
+        # Try to load from .env file on server
+        env_file = '/opt/cumulus-distributed/.env'
+        s3_config = {}
+        
+        if os.path.exists(env_file):
+            print(f"📁 Loading S3 config from: {env_file}")
+            with open(env_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip().strip('"').strip("'")
+                        s3_config[key] = value
+        
+        # Fallback defaults if not in .env or file doesn't exist
+        defaults = {
             'CUMULUS_S3_BUCKET': 'cumulus-jobs',
             'CUMULUS_S3_REGION': 'us-east-1',
             'AWS_ACCESS_KEY_ID': '',
@@ -177,6 +195,11 @@ class CodeExecutor:
             'CUMULUS_ENABLE_JOB_METADATA': 'true',
             'CUMULUS_METADATA_TTL_SECONDS': '86400'
         }
+        
+        # Merge defaults with .env values
+        for key, value in defaults.items():
+            if key not in s3_config:
+                s3_config[key] = value
         
         # Set environment variables if not already set
         for key, value in s3_config.items():

@@ -166,7 +166,7 @@ def main():
     # Run complete test
     result = client.run(
         func=complete_nn_training_and_resume,
-        gpu_memory=0.8,
+        gpu_memory=0.4,
         duration=600,
         requirements=["torch", "boto3"]
     )
