@@ -174,7 +174,7 @@ def test_unified_with_s3():
 
 if __name__ == "__main__":
     # Connect to remote server
-    client = CumulusClient("http://localhost:8080")
+    client = CumulusClient("http://localhost:8083")
     
     print("🚀 Testing unified checkpointing with S3 integration for all frameworks on remote GPU server...")
     

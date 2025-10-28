@@ -166,7 +166,7 @@ def main():
     print("=" * 60)
     
     # Create client
-    client = CumulusClient("http://localhost:8080")
+    client = CumulusClient("http://localhost:8084")
     
     # Run complete test
     result = client.run(
