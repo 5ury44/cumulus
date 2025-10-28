@@ -408,6 +408,134 @@ class DistributedCheckpointer:
             except Exception as e:
                 logger.warning(f"Failed to remove checkpoint {checkpoint['path']}: {e}")
 
+    # -------------------------------
+    # Generic Artifact Store (L1/L2)
+    # -------------------------------
+    def _artifact_local_path(self, name: str) -> str:
+        safe_name = os.path.basename(name)
+        return os.path.join(self.local_dir, safe_name)
+
+    def _artifact_s3_key(self, name: str) -> Optional[str]:
+        if not self.s3_client:
+            return None
+        safe_name = os.path.basename(name)
+        return f"artifacts/{self.job_id}/{safe_name}"
+
+    def save_artifact_file(self, name: str, src_path: str) -> Dict[str, Optional[str]]:
+        """Save an arbitrary file as an artifact to L1 and optionally L2.
+
+        Returns dict with 'local_path' and optional 's3_key'.
+        """
+        local_path = self._artifact_local_path(name)
+        try:
+            import shutil
+            shutil.copy2(src_path, local_path)
+            logger.info(f"✅ Artifact saved to L1: {local_path}")
+        except Exception as e:
+            logger.error(f"❌ Failed to copy artifact to L1: {e}")
+            raise
+
+        s3_key = self._artifact_s3_key(name)
+        if s3_key:
+            try:
+                self.s3_client.upload_file(local_path, self.s3_bucket, s3_key)
+                logger.info(f"✅ Artifact synced to L2: s3://{self.s3_bucket}/{s3_key}")
+            except Exception as e:
+                logger.warning(f"❌ Failed to sync artifact to S3: {e}")
+                s3_key = None
+
+        return {"local_path": local_path, "s3_key": s3_key}
+
+    def save_artifact_bytes(self, name: str, data: bytes) -> Dict[str, Optional[str]]:
+        """Save raw bytes as an artifact to L1 and optionally L2."""
+        local_path = self._artifact_local_path(name)
+        try:
+            with open(local_path, 'wb') as f:
+                f.write(data)
+            logger.info(f"✅ Artifact bytes saved to L1: {local_path}")
+        except Exception as e:
+            logger.error(f"❌ Failed to write artifact to L1: {e}")
+            raise
+
+        s3_key = self._artifact_s3_key(name)
+        if s3_key:
+            try:
+                self.s3_client.upload_file(local_path, self.s3_bucket, s3_key)
+                logger.info(f"✅ Artifact synced to L2: s3://{self.s3_bucket}/{s3_key}")
+            except Exception as e:
+                logger.warning(f"❌ Failed to sync artifact to S3: {e}")
+                s3_key = None
+
+        return {"local_path": local_path, "s3_key": s3_key}
+
+    def load_artifact_to_path(self, name: str, dst_path: Optional[str] = None) -> str:
+        """Ensure artifact is present locally and return its path, optionally copying to dst_path."""
+        local_path = self._artifact_local_path(name)
+        if not os.path.exists(local_path) and self.s3_client:
+            s3_key = self._artifact_s3_key(name)
+            if s3_key:
+                try:
+                    self.s3_client.download_file(self.s3_bucket, s3_key, local_path)
+                    logger.info(f"Downloaded artifact from L2: s3://{self.s3_bucket}/{s3_key} -> {local_path}")
+                except Exception as e:
+                    raise FileNotFoundError(f"Artifact not found in L1 or L2: {name}; error: {e}")
+
+        if not os.path.exists(local_path):
+            raise FileNotFoundError(f"Artifact not found: {name}")
+
+        if dst_path:
+            import shutil
+            shutil.copy2(local_path, dst_path)
+            return dst_path
+        return local_path
+
+    def load_artifact_bytes(self, name: str) -> bytes:
+        """Load artifact as bytes, downloading from L2 if needed."""
+        path = self.load_artifact_to_path(name)
+        with open(path, 'rb') as f:
+            return f.read()
+
+    def list_artifacts(self, prefix: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List artifacts across L1 and L2 (filenames only for S3 unless downloaded)."""
+        results: List[Dict[str, Any]] = []
+
+        # L1
+        if os.path.isdir(self.local_dir):
+            for fname in os.listdir(self.local_dir):
+                if prefix and not fname.startswith(prefix):
+                    continue
+                fpath = os.path.join(self.local_dir, fname)
+                if os.path.isfile(fpath) and not fname.startswith('ckpt_') and not fname.endswith('.pt'):
+                    results.append({
+                        'name': fname,
+                        'path': fpath,
+                        'source': 'L1 (local)',
+                        'timestamp': os.path.getmtime(fpath)
+                    })
+
+        # L2
+        if self.s3_client:
+            try:
+                response = self.s3_client.list_objects_v2(
+                    Bucket=self.s3_bucket,
+                    Prefix=f"artifacts/{self.job_id}/"
+                )
+                if 'Contents' in response:
+                    for obj in response['Contents']:
+                        key = obj['Key']
+                        if prefix and not os.path.basename(key).startswith(prefix):
+                            continue
+                        results.append({
+                            'name': os.path.basename(key),
+                            'path': f"s3://{self.s3_bucket}/{key}",
+                            'source': 'L2 (S3)',
+                            'timestamp': obj['LastModified'].timestamp()
+                        })
+            except Exception as e:
+                logger.debug(f"Failed to list S3 artifacts: {e}")
+
+        return sorted(results, key=lambda x: x['timestamp'], reverse=True)
+
 
 def create_distributed_checkpointer(job_id: str, **kwargs) -> DistributedCheckpointer:
     """

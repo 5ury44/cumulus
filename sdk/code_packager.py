@@ -193,8 +193,9 @@ Cumulus Runtime Helper - Provides checkpointing and pause/resume functionality
 import os
 import json
 import time
+import signal
 import torch
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Callable
 
 # Import distributed checkpointing if available
 try:
@@ -366,6 +367,127 @@ def find_latest_checkpoint(**kwargs):
     elif hasattr(checkpointer, 'exists') and checkpointer.exists():
         return checkpointer.path
     return None
+
+
+class _SaveOnInterrupt:
+    """Context manager to save a checkpoint on SIGINT/SIGTERM/KeyboardInterrupt.
+
+    Usage:
+        with save_on_interrupt(ckpt, model, optimizer, lambda: epoch, lambda: step):
+            ... training loop ...
+    """
+
+    def __init__(self,
+                 checkpointer: Checkpointer,
+                 model: torch.nn.Module,
+                 optimizer: torch.optim.Optimizer,
+                 get_epoch: Callable[[], int],
+                 get_step: Callable[[], int]):
+        self.checkpointer = checkpointer
+        self.model = model
+        self.optimizer = optimizer
+        self.get_epoch = get_epoch
+        self.get_step = get_step
+        self._prev_sigint = None
+        self._prev_sigterm = None
+
+    def __enter__(self):
+        def _handler(signum, frame):
+            try:
+                epoch = int(self.get_epoch())
+                step = int(self.get_step())
+                self.checkpointer.save(self.model, self.optimizer, epoch, step)
+            except Exception:
+                pass
+            if signum == signal.SIGINT:
+                raise KeyboardInterrupt
+            else:
+                raise SystemExit(0)
+
+        self._prev_sigint = signal.getsignal(signal.SIGINT)
+        self._prev_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGINT, _handler)
+        signal.signal(signal.SIGTERM, _handler)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._prev_sigint is not None:
+            signal.signal(signal.SIGINT, self._prev_sigint)
+        if self._prev_sigterm is not None:
+            signal.signal(signal.SIGTERM, self._prev_sigterm)
+        return False
+
+
+def save_on_interrupt(checkpointer: Checkpointer,
+                      model: torch.nn.Module,
+                      optimizer: torch.optim.Optimizer,
+                      get_epoch: Callable[[], int],
+                      get_step: Callable[[], int]) -> _SaveOnInterrupt:
+    """Return a context manager that saves a checkpoint on Ctrl-C/terminate."""
+    return _SaveOnInterrupt(checkpointer, model, optimizer, get_epoch, get_step)
+
+
+class LocalArtifactStore:
+    """Local artifact store that mirrors the distributed interface (L1 only)."""
+
+    def __init__(self, local_dir: Optional[str] = None):
+        self.local_dir = local_dir or job_dir()
+        os.makedirs(self.local_dir, exist_ok=True)
+
+    def _artifact_local_path(self, name: str) -> str:
+        safe_name = os.path.basename(name)
+        return os.path.join(self.local_dir, safe_name)
+
+    def save_artifact_file(self, name: str, src_path: str) -> Dict[str, Optional[str]]:
+        import shutil
+        dst = self._artifact_local_path(name)
+        shutil.copy2(src_path, dst)
+        return {"local_path": dst, "s3_key": None}
+
+    def save_artifact_bytes(self, name: str, data: bytes) -> Dict[str, Optional[str]]:
+        dst = self._artifact_local_path(name)
+        with open(dst, 'wb') as f:
+            f.write(data)
+        return {"local_path": dst, "s3_key": None}
+
+    def load_artifact_to_path(self, name: str, dst_path: Optional[str] = None) -> str:
+        src = self._artifact_local_path(name)
+        if not os.path.exists(src):
+            raise FileNotFoundError(f"Artifact not found: {name}")
+        if dst_path:
+            import shutil
+            shutil.copy2(src, dst_path)
+            return dst_path
+        return src
+
+    def load_artifact_bytes(self, name: str) -> bytes:
+        src = self._artifact_local_path(name)
+        with open(src, 'rb') as f:
+            return f.read()
+
+    def list_artifacts(self, prefix: Optional[str] = None) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        for fname in os.listdir(self.local_dir):
+            if prefix and not fname.startswith(prefix):
+                continue
+            fpath = os.path.join(self.local_dir, fname)
+            if os.path.isfile(fpath) and not fname.startswith('ckpt_') and not fname.endswith('.pt'):
+                items.append({
+                    'name': fname,
+                    'path': fpath,
+                    'source': 'L1 (local)',
+                    'timestamp': os.path.getmtime(fpath)
+                })
+        return sorted(items, key=lambda x: x['timestamp'], reverse=True)
+
+
+def get_artifact_store(job_id: str = None, use_distributed: bool = True, **kwargs):
+    """Get distributed artifact store if available, else local store."""
+    if use_distributed:
+        dc = get_distributed_checkpointer(job_id, **kwargs)
+        if dc:
+            return dc
+    return LocalArtifactStore()
 '''
     
     def _get_distributed_checkpointer(self) -> str:

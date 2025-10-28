@@ -5,7 +5,7 @@ Complete neural network training and resume test in a single job
 
 import sys
 import os
-sys.path.insert(0, '/Users/surycuh/cumulus-pivot/distributed-checkpoint/cumulus')
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from sdk.client import CumulusClient
 import time
@@ -16,7 +16,7 @@ def complete_nn_training_and_resume():
     import torch
     import torch.nn as nn
     import torch.optim as optim
-    from runtime import get_checkpointer
+    from runtime import get_checkpointer, save_on_interrupt
     
     print("🚀 Complete Neural Network Training and Resume Test")
     print("=" * 60)
@@ -56,33 +56,36 @@ def complete_nn_training_and_resume():
     batch_size = 64
     
     print(f"\n📋 Phase 1: Training first 3 epochs")
-    for epoch in range(3):
-        epoch_loss = 0.0
-        correct = 0
-        total = 0
-        num_batches = len(X) // batch_size
-        
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = start_idx + batch_size
+    epoch = 0
+    batch_idx = 0
+    num_batches = len(X) // batch_size
+    with save_on_interrupt(checkpointer, model, optimizer, lambda: epoch, lambda: batch_idx):
+        for epoch in range(3):
+            epoch_loss = 0.0
+            correct = 0
+            total = 0
             
-            data = X[start_idx:end_idx]
-            target = y[start_idx:end_idx]
-            
-            # Forward pass
-            optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            
-            # Backward pass
-            loss.backward()
-            optimizer.step()
-            
-            # Statistics
-            epoch_loss += loss.item()
-            _, predicted = torch.max(output.data, 1)
-            total += target.size(0)
-            correct += (predicted == target).sum().item()
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = start_idx + batch_size
+                
+                data = X[start_idx:end_idx]
+                target = y[start_idx:end_idx]
+                
+                # Forward pass
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+                
+                # Backward pass
+                loss.backward()
+                optimizer.step()
+                
+                # Statistics
+                epoch_loss += loss.item()
+                _, predicted = torch.max(output.data, 1)
+                total += target.size(0)
+                correct += (predicted == target).sum().item()
         
         avg_loss = epoch_loss / num_batches
         accuracy = 100 * correct / total
@@ -105,35 +108,38 @@ def complete_nn_training_and_resume():
         
         # Continue training for remaining epochs
         print(f"\n📋 Phase 3: Continuing training for remaining epochs")
-        for epoch in range(start_epoch + 1, epochs):
-            epoch_loss = 0.0
-            correct = 0
-            total = 0
-            num_batches = len(X) // batch_size
-            
-            batch_start = 0 if epoch > start_epoch else start_batch + 1
-            
-            for batch_idx in range(batch_start, num_batches):
-                start_idx = batch_idx * batch_size
-                end_idx = start_idx + batch_size
+        epoch = start_epoch
+        batch_idx = 0
+        with save_on_interrupt(checkpointer, model, optimizer, lambda: epoch, lambda: batch_idx):
+            for epoch in range(start_epoch + 1, epochs):
+                epoch_loss = 0.0
+                correct = 0
+                total = 0
+                num_batches = len(X) // batch_size
                 
-                data = X[start_idx:end_idx]
-                target = y[start_idx:end_idx]
+                batch_start = 0 if epoch > start_epoch else start_batch + 1
                 
-                # Forward pass
-                optimizer.zero_grad()
-                output = model(data)
-                loss = criterion(output, target)
-                
-                # Backward pass
-                loss.backward()
-                optimizer.step()
-                
-                # Statistics
-                epoch_loss += loss.item()
-                _, predicted = torch.max(output.data, 1)
-                total += target.size(0)
-                correct += (predicted == target).sum().item()
+                for batch_idx in range(batch_start, num_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = start_idx + batch_size
+                    
+                    data = X[start_idx:end_idx]
+                    target = y[start_idx:end_idx]
+                    
+                    # Forward pass
+                    optimizer.zero_grad()
+                    output = model(data)
+                    loss = criterion(output, target)
+                    
+                    # Backward pass
+                    loss.backward()
+                    optimizer.step()
+                    
+                    # Statistics
+                    epoch_loss += loss.item()
+                    _, predicted = torch.max(output.data, 1)
+                    total += target.size(0)
+                    correct += (predicted == target).sum().item()
             
             avg_loss = epoch_loss / max(1, num_batches - batch_start)
             accuracy = 100 * correct / total
