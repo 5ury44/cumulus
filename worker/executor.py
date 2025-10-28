@@ -130,7 +130,8 @@ class CodeExecutor:
     async def execute_with_cumulus(self, 
                                  job_dir: str, 
                                  job_id: str,
-                                 partition_id: str) -> Any:
+                                 partition_id: str,
+                                 device_index: Optional[int] = None) -> Any:
         """
         Execute code within a Cumulus partition.
         
@@ -148,6 +149,11 @@ class CodeExecutor:
             env['CUMULUS_PARTITION_ID'] = partition_id
             env['CUMULUS_JOB_ID'] = job_id
             env['CUMULUS_JOB_DIR'] = job_dir  # Add job directory for checkpointing
+            if device_index is not None:
+                env['CUMULUS_DEVICE_INDEX'] = str(device_index)
+                env['CUDA_VISIBLE_DEVICES'] = str(device_index)
+            # Helpful defaults for TF/Keras memory behavior
+            env.setdefault('TF_FORCE_GPU_ALLOW_GROWTH', 'true')
             
             # Set up S3 distributed checkpointing environment
             self._setup_s3_environment(env)

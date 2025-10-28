@@ -29,30 +29,77 @@ This guide walks you through setting up the complete Cumulus distributed executi
 - Python 3.8+
 - Internet connection to remote server
 
-## 🚀 Quick Setup
+## 🚀 Quick Setup (From Scratch)
 
-### 1. Install Cumulus on Remote Server
-
-```bash
-# On your GPU server (clean machine)
-python3 -m venv cumulus-env
-source cumulus-env/bin/activate
-pip install -e .
-
-# Build vendored Chronos (recommended) or ensure system chronos_cli is available
-# See cumulus/chronos_vendor/README.md for build steps
-```
-
-### 2. Install Cumulus Worker on Remote Server
+### 1. Prepare Remote GPU Server
 
 ```bash
 # On your GPU server
-cd /path/to/cumulus
+apt-get update
+apt-get install -y git build-essential cmake ocl-icd-opencl-dev opencl-headers python3 python3-venv python3-pip curl
+
+# Verify GPU
+nvidia-smi
+```
+
+### 2. Get the Code and Build Chronos (GPU Partitioner)
+
+```bash
+# Clone repo to /opt
+mkdir -p /opt && cd /opt
+git clone https://github.com/5ury44/cumulus.git
+
+# Build & install Chronos GPU partitioner
+cd /opt/cumulus/chronos_core
+bash scripts/install-quick.sh
+
+# Verify Chronos CLI
+chronos stats   # or /usr/local/bin/chronos_cli stats
+```
+
+### 3. Python Environment + Worker Install
+
+```bash
+# Create venv and install server
+python3 -m venv /opt/cumulus-env
+source /opt/cumulus-env/bin/activate
+pip install --upgrade pip wheel setuptools
+
+cd /opt/cumulus
 pip install -e .
 
-# Start the worker server
-cumulus-cli serve --host 0.0.0.0 --port 8080
+# Install CUDA-enabled PyTorch
+pip install --upgrade torch torchvision
+python - <<'PY'
+import torch
+print('cuda_available=', torch.cuda.is_available(), 'cuda_version=', torch.version.cuda)
+PY
 ```
+
+### 4. Configure S3 (Distributed Checkpointing + Artifact Store)
+
+The worker automatically loads S3 config from `/opt/cumulus-distributed/.env` if present.
+
+```bash
+mkdir -p /opt/cumulus-distributed
+cat >/opt/cumulus-distributed/.env << 'EOF'
+CUMULUS_S3_BUCKET=your-bucket
+CUMULUS_S3_REGION=us-east-1
+AWS_ACCESS_KEY_ID=your_key
+AWS_SECRET_ACCESS_KEY=your_secret
+
+# L1 local cache (checkpoints)
+CUMULUS_LOCAL_CACHE_DIR=/tmp/cumulus/checkpoints
+CUMULUS_CACHE_SIZE_LIMIT_GB=10.0
+CUMULUS_KEEP_CHECKPOINTS=5
+CUMULUS_CHECKPOINT_EVERY_STEPS=100
+CUMULUS_CHECKPOINT_EVERY_SECONDS=300
+CUMULUS_AUTO_CLEANUP=true
+CUMULUS_ENABLE_JOB_METADATA=true
+EOF
+```
+
+Required IAM permissions on the bucket: s3:PutObject, s3:GetObject, s3:ListBucket, s3:DeleteObject (optional for cleanup).
 
 ### 3. Install Cumulus SDK on Local Machine
 
@@ -67,7 +114,7 @@ pip install -e ".[ml]"
 
 ## 🔧 Detailed Setup
 
-### Remote Server Setup
+### Remote Server Setup (Details)
 
 #### Step 1: Install System Dependencies
 
@@ -78,9 +125,9 @@ sudo apt update && sudo apt upgrade -y
 # Install Python and pip
 sudo apt install -y python3 python3-pip python3-venv
 
-# Install Cumulus (see ../chronos/INSTALL_GPU.md for details)
-cd /path/to/chronos
-./install-chronos-gpu.sh
+# Build Chronos from source (if skipping quick setup above)
+cd /opt/cumulus/chronos_core
+bash scripts/install-quick.sh
 ```
 
 #### Step 2: Install Cumulus Worker
@@ -93,35 +140,25 @@ cd /path/to/cumulus
 python3 -m venv cumulus-env
 source cumulus-env/bin/activate
 
-# Install cumulus worker
+# Install cumulus worker in venv
 pip install -e .
-
-# Install additional dependencies if needed
-pip install torch torchvision  # For ML workloads
 ```
 
 #### Step 3: Configure and Start Worker
 
 ```bash
-# Create job directory
-sudo mkdir -p /tmp/cumulus_jobs
-sudo chmod 777 /tmp/cumulus_jobs
-
-# Start worker server
-cumulus-cli serve --host 0.0.0.0 --port 8080 --workers 4
-
-# Or run in background
-nohup cumulus-cli serve --host 0.0.0.0 --port 8080 > worker.log 2>&1 &
+# Start worker on a free port (8081 used if 8080 busy)
+source /opt/cumulus-env/bin/activate
+cd /opt/cumulus
+python -m uvicorn worker.server:create_app --factory --host 0.0.0.0 --port 8081
 ```
 
 #### Step 4: Verify Worker is Running
 
 ```bash
-# Check if worker is responding
-curl http://localhost:8080/health
-
-# Check server info
-curl http://localhost:8080/api/info
+# Health + server info
+curl http://localhost:8081/health
+curl http://localhost:8081/api/info
 ```
 
 ### Local Machine Setup
@@ -143,16 +180,24 @@ pip install -e .
 pip install -e ".[ml]"
 ```
 
-#### Step 2: Test Connection
+#### Step 2: Test Connection (with SSH tunnel)
+
+````python
+From your laptop:
+
+```bash
+# Forward local 8080 to server 8081
+ssh -p <port> -N -f -L 8080:localhost:8081 root@<ip>
+curl -s http://localhost:8080/health
+````
 
 ```python
 from cumulus.sdk import CumulusClient
-
-# Test connection to remote server
-client = CumulusClient("http://your-server:8080")
-info = client.get_server_info()
-print(f"Server info: {info}")
+client = CumulusClient("http://localhost:8080")
+print(client.get_server_info())
 ```
+
+````
 
 ## 🎯 Usage Examples
 
@@ -178,7 +223,7 @@ result = client.run(
 )
 
 print(f"Result: {result}")
-```
+````
 
 ### Using Decorators
 
@@ -239,6 +284,31 @@ result = pytorch_training()
 print(f"Training completed: {result}")
 ```
 
+## ✅ Validation
+
+### GPU partitioning
+
+```bash
+chronos stats
+chronos create 0 0.5 3600   # optional, creates 50% partition for 1h
+chronos list
+```
+
+### End-to-end tests (from laptop)
+
+```bash
+# 1) Complete NN training + checkpoint/resume (uploads checkpoints to S3)
+python cumulus/tests/test_complete_nn.py
+
+# 2) Artifact store (uploads artifacts to S3 when configured)
+python cumulus/tests/test_artifact_store.py
+```
+
+Check S3:
+
+- Checkpoints: `s3://<bucket>/checkpoints/<job_id>/...`
+- Artifacts: `s3://<bucket>/artifacts/<job_id>/...`
+
 ## 🔍 Monitoring and Debugging
 
 ### Check Server Status
@@ -270,12 +340,12 @@ for job in jobs:
 ### Debugging
 
 ```bash
-# Check worker logs
-tail -f worker.log
+# Worker logs (if run with nohup)
+tail -f /tmp/cumulus-worker.log 2>/dev/null || echo "Check your process manager logs"
 
-# Check Chronos status (vendored)
-cumulus-cli chronos stats
-cumulus-cli chronos list
+# Chronos status
+chronos stats
+chronos list
 
 # Check job directories
 ls -la /tmp/cumulus_jobs/

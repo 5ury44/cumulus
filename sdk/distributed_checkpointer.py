@@ -9,11 +9,27 @@ import os
 import json
 import time
 import socket
-import boto3
-import torch
+try:
+    import boto3
+    _BOTO3_AVAILABLE = True
+except Exception:
+    boto3 = None
+    _BOTO3_AVAILABLE = False
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 import logging
+from .framework_adapters import pick_adapter
+
+# Try to load .env file if available
+try:
+    from dotenv import load_dotenv
+    env_file = '/opt/cumulus-distributed/.env'
+    if os.path.exists(env_file):
+        load_dotenv(env_file)
+        logger = logging.getLogger(__name__)
+        logger.info(f"Loaded environment variables from {env_file}")
+except ImportError:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +74,7 @@ class DistributedCheckpointer:
         
         # Initialize S3 client if bucket is configured
         self.s3_client = None
-        if self.s3_bucket:
+        if self.s3_bucket and _BOTO3_AVAILABLE:
             try:
                 session = boto3.Session(
                     aws_access_key_id=aws_access_key_id or os.getenv('AWS_ACCESS_KEY_ID'),
@@ -70,13 +86,15 @@ class DistributedCheckpointer:
             except Exception as e:
                 logger.warning(f"Failed to initialize S3 client: {e}")
                 self.s3_client = None
+        elif self.s3_bucket and not _BOTO3_AVAILABLE:
+            logger.warning("S3 bucket configured but boto3 not available. Install boto3 for S3 support.")
         
         # Job metadata tracking
         self.metadata_key = f"jobs/{self.job_id}/metadata.json"
         
     def save(self, 
-             model: torch.nn.Module, 
-             optimizer: torch.optim.Optimizer, 
+             model: Any, 
+             optimizer: Any, 
              epoch: int, 
              step: int,
              extra: Dict[str, Any] = None) -> Dict[str, str]:
@@ -93,6 +111,8 @@ class DistributedCheckpointer:
         Returns:
             Dict with 'local_path' and 's3_key' of saved checkpoint
         """
+        # Local import to avoid hard dependency at module import time
+        import torch
         checkpoint_id = f"ckpt_{epoch}_{step}"
         
         # Create checkpoint data
@@ -137,10 +157,113 @@ class DistributedCheckpointer:
             's3_key': s3_key,
             'checkpoint_id': checkpoint_id
         }
+
+    # -------------------------------
+    # Unified, framework-agnostic API
+    # -------------------------------
+    def _write_sidecar_metadata(self, data_file: str, framework: str, epoch: int, step: int, extra: Dict[str, Any]):
+        meta = {
+            'framework': framework,
+            'epoch': epoch,
+            'step': step,
+            'job_id': self.job_id,
+            'created_at': time.time(),
+            'extra': extra or {}
+        }
+        meta_path = f"{data_file}.meta.json"
+        try:
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+            if self.s3_client:
+                key = f"checkpoints/{self.job_id}/{os.path.basename(meta_path)}"
+                self.s3_client.upload_file(meta_path, self.s3_bucket, key)
+        except Exception as e:
+            logger.warning(f"Failed to write/upload sidecar metadata: {e}")
+
+    def save_checkpoint(self,
+                        model: Any = None,
+                        optimizer: Any = None,
+                        epoch: int = 0,
+                        step: int = 0,
+                        extra: Dict[str, Any] = None,
+                        framework: Optional[str] = None) -> Dict[str, Optional[str]]:
+        """Framework-agnostic save.
+
+        Determines adapter by model type or framework hint, writes sidecar metadata,
+        uploads to S3 if configured, and updates job metadata.
+        """
+        adapter = pick_adapter(model, framework)
+        checkpoint_id = f"ckpt_{epoch}_{step}"
+        filename = f"{checkpoint_id}.{adapter.ext}"
+        local_path = os.path.join(self.local_dir, filename)
+        os.makedirs(self.local_dir, exist_ok=True)
+
+        # Delegate to adapter
+        adapter.save(model, local_path, optimizer)
+
+        # Sidecar metadata (for listing without framework imports)
+        self._write_sidecar_metadata(local_path, adapter.name, epoch, step, extra or {})
+
+        # Sync to S3
+        s3_key: Optional[str] = None
+        if self.s3_client:
+            s3_key = f"checkpoints/{self.job_id}/{filename}"
+            try:
+                self.s3_client.upload_file(local_path, self.s3_bucket, s3_key)
+            except Exception as e:
+                logger.error(f"Failed to sync checkpoint to S3: {e}")
+                s3_key = None
+
+        # Update job metadata
+        self._update_job_metadata(epoch, step, checkpoint_id, local_path, s3_key)
+
+        return {
+            'local_path': local_path,
+            's3_key': s3_key,
+            'checkpoint_id': checkpoint_id
+        }
+
+    def load_checkpoint(self,
+                        model: Any = None,
+                        optimizer: Any = None,
+                        checkpoint_path: Optional[str] = None,
+                        framework: Optional[str] = None) -> Dict[str, Any]:
+        """Framework-agnostic load.
+
+        If framework is not provided, infer from filename extension or model type.
+        Returns a dict including resolved local path and loaded state.
+        """
+        # Resolve local path (supports local file, s3:// URL, or S3 key)
+        local_path = (self._ensure_local_from_checkpoint_path(checkpoint_path)
+                      if checkpoint_path else self._find_latest_checkpoint())
+        if not local_path or not os.path.exists(local_path):
+            raise FileNotFoundError(f"No checkpoint found at: {local_path}")
+
+        # Infer framework by extension if hint is missing
+        if framework is None:
+            base = os.path.basename(local_path).lower()
+            if base.endswith('.pt'):
+                framework = 'pytorch'
+            elif base.endswith(('.h5', 'weights.h5')):
+                framework = 'tensorflow'
+            elif base.endswith('.pkl'):
+                framework = 'sklearn'
+            elif base.endswith('.json'):
+                framework = 'xgboost'
+            elif base.endswith('.txt'):
+                framework = 'lightgbm'
+
+        adapter = pick_adapter(model, framework)
+        state = adapter.load(model, local_path, optimizer)
+        return {
+            'local_path': local_path,
+            'framework': adapter.name,
+            'state': state
+        }
     
     def load(self, 
-             model: torch.nn.Module, 
-             optimizer: torch.optim.Optimizer,
+             model: Any, 
+             optimizer: Any,
              checkpoint_path: Optional[str] = None) -> Dict[str, Any]:
         """
         Load checkpoint from L1 or L2 cache.
@@ -163,6 +286,8 @@ class DistributedCheckpointer:
         if not local_path or not os.path.exists(local_path):
             raise FileNotFoundError(f"No checkpoint found at: {local_path}")
         
+        # Local import to avoid hard dependency at module import time
+        import torch
         # Load checkpoint
         state = torch.load(local_path, map_location='cpu')
         
@@ -221,55 +346,93 @@ class DistributedCheckpointer:
         return self._find_latest_checkpoint()
     
     def list_checkpoints(self) -> List[Dict[str, Any]]:
-        """List all available checkpoints."""
-        checkpoints = []
-        
-        # Check L1 cache
-        for fname in os.listdir(self.local_dir):
-            if fname.startswith('ckpt_') and fname.endswith('.pt'):
-                fpath = os.path.join(self.local_dir, fname)
-                try:
-                    state = torch.load(fpath, map_location='cpu')
-                    checkpoints.append({
-                        'filename': fname,
-                        'path': fpath,
-                        'epoch': state.get('epoch', 0),
-                        'step': state.get('step', 0),
-                        'timestamp': os.path.getmtime(fpath),
-                        'source': 'L1 (local)',
-                        'metadata': state.get('metadata', {})
-                    })
-                except Exception as e:
-                    logger.warning(f"Failed to load checkpoint {fname}: {e}")
-        
-        # Check L2 cache (S3)
+        """List all available checkpoints (sidecar-first, framework-agnostic)."""
+        checkpoints: List[Dict[str, Any]] = []
+
+        # Check L1 cache for sidecars
+        if os.path.isdir(self.local_dir):
+            for fname in os.listdir(self.local_dir):
+                if fname.endswith('.meta.json'):
+                    meta_path = os.path.join(self.local_dir, fname)
+                    try:
+                        with open(meta_path, 'r') as f:
+                            meta = json.load(f)
+                        data_fname = fname[:-10]  # strip ".meta.json"
+                        data_path = os.path.join(self.local_dir, data_fname)
+                        ts_source = data_path if os.path.exists(data_path) else meta_path
+                        checkpoints.append({
+                            'filename': data_fname,
+                            'path': data_path,
+                            'epoch': meta.get('epoch', 0),
+                            'step': meta.get('step', 0),
+                            'framework': meta.get('framework', 'unknown'),
+                            'timestamp': os.path.getmtime(ts_source),
+                            'source': 'L1 (local)',
+                            'metadata': meta
+                        })
+                    except Exception as e:
+                        logger.debug(f"Failed to read sidecar {fname}: {e}")
+
+            # Legacy .pt without sidecar
+            for fname in os.listdir(self.local_dir):
+                if fname.startswith('ckpt_') and fname.endswith('.pt') and not os.path.exists(os.path.join(self.local_dir, f"{fname}.meta.json")):
+                    fpath = os.path.join(self.local_dir, fname)
+                    try:
+                        checkpoints.append({
+                            'filename': fname,
+                            'path': fpath,
+                            'epoch': 0,
+                            'step': 0,
+                            'framework': 'pytorch',
+                            'timestamp': os.path.getmtime(fpath),
+                            'source': 'L1 (local)',
+                            'metadata': {}
+                        })
+                    except Exception:
+                        continue
+
+        # Check L2 cache (S3) for sidecars
         if self.s3_client:
             try:
                 response = self.s3_client.list_objects_v2(
                     Bucket=self.s3_bucket,
                     Prefix=f"checkpoints/{self.job_id}/"
                 )
-                
                 if 'Contents' in response:
                     for obj in response['Contents']:
-                        if obj['Key'].endswith('.pt'):
-                            # Extract checkpoint info from S3 metadata
-                            s3_key = obj['Key']
-                            filename = os.path.basename(s3_key)
-                            
+                        key = obj['Key']
+                        if key.endswith('.meta.json'):
+                            try:
+                                meta_obj = self.s3_client.get_object(Bucket=self.s3_bucket, Key=key)
+                                meta = json.loads(meta_obj['Body'].read().decode('utf-8'))
+                            except Exception:
+                                meta = {}
+                            data_fname = os.path.basename(key)[:-10]
                             checkpoints.append({
-                                'filename': filename,
-                                'path': f"s3://{self.s3_bucket}/{s3_key}",
-                                'epoch': 0,  # Would need to download to get full info
+                                'filename': data_fname,
+                                'path': f"s3://{self.s3_bucket}/{key[:-10]}",
+                                'epoch': meta.get('epoch', 0),
+                                'step': meta.get('step', 0),
+                                'framework': meta.get('framework', 'unknown'),
+                                'timestamp': obj['LastModified'].timestamp(),
+                                'source': 'L2 (S3)',
+                                'metadata': meta
+                            })
+                        # Legacy .pt entries (no sidecar)
+                        elif key.endswith('.pt'):
+                            checkpoints.append({
+                                'filename': os.path.basename(key),
+                                'path': f"s3://{self.s3_bucket}/{key}",
+                                'epoch': 0,
                                 'step': 0,
+                                'framework': 'pytorch',
                                 'timestamp': obj['LastModified'].timestamp(),
                                 'source': 'L2 (S3)',
                                 'metadata': {}
                             })
             except Exception as e:
                 logger.warning(f"Failed to list S3 checkpoints: {e}")
-        
-        # Sort by timestamp (newest first)
+
         return sorted(checkpoints, key=lambda x: x['timestamp'], reverse=True)
     
     def _find_latest_checkpoint(self) -> Optional[str]:
@@ -278,7 +441,10 @@ class DistributedCheckpointer:
         # Check L1 cache first (fastest)
         local_checkpoints = []
         for fname in os.listdir(self.local_dir):
-            if fname.startswith('ckpt_') and fname.endswith('.pt'):
+            # Look for any checkpoint file (not just .pt)
+            if fname.startswith('ckpt_') and (fname.endswith('.pt') or fname.endswith('.h5') or 
+                                            fname.endswith('.pkl') or fname.endswith('.json') or 
+                                            fname.endswith('.txt')):
                 fpath = os.path.join(self.local_dir, fname)
                 local_checkpoints.append((fpath, os.path.getmtime(fpath)))
         

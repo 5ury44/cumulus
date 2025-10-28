@@ -266,7 +266,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/jobs/{job_id}/checkpoints")
     async def get_checkpoints(job_id: str):
-        """Get available checkpoints for a job."""
+        """Get available checkpoints for a job (framework-agnostic, sidecar-first)."""
         if job_id not in jobs:
             raise HTTPException(status_code=404, detail="Job not found")
         
@@ -275,17 +275,38 @@ def create_app() -> FastAPI:
             checkpoints = []
             
             if os.path.exists(job_dir):
+                # Prefer sidecar metadata files (*.meta.json)
                 for fname in os.listdir(job_dir):
-                    if fname.endswith('.pt'):
+                    if fname.endswith('.meta.json'):
+                        meta_path = os.path.join(job_dir, fname)
+                        try:
+                            with open(meta_path, 'r') as f:
+                                meta = json.load(f)
+                            data_fname = fname[:-10]  # strip ".meta.json"
+                            data_path = os.path.join(job_dir, data_fname)
+                            ts_source = data_path if os.path.exists(data_path) else meta_path
+                            checkpoints.append({
+                                'filename': data_fname,
+                                'path': data_path,
+                                'epoch': meta.get('epoch', 0),
+                                'step': meta.get('step', 0),
+                                'framework': meta.get('framework', 'unknown'),
+                                'timestamp': os.path.getmtime(ts_source)
+                            })
+                        except Exception:
+                            continue
+
+                # Legacy PyTorch checkpoints without sidecar
+                for fname in os.listdir(job_dir):
+                    if fname.endswith('.pt') and not os.path.exists(os.path.join(job_dir, f"{fname}.meta.json")):
                         fpath = os.path.join(job_dir, fname)
                         try:
-                            import torch
-                            state = torch.load(fpath, map_location='cpu')
                             checkpoints.append({
                                 'filename': fname,
                                 'path': fpath,
-                                'epoch': state.get('epoch', 0),
-                                'step': state.get('step', 0),
+                                'epoch': 0,
+                                'step': 0,
+                                'framework': 'pytorch',
                                 'timestamp': os.path.getmtime(fpath)
                             })
                         except Exception:
@@ -329,8 +350,10 @@ async def execute_job(job_id: str, code_data: bytes, gpu_memory: float, duration
         )
         job.partition_id = partition_id
         
-        # Execute code
-        result = await executor.execute_with_cumulus(job_dir, job_id, partition_id)
+        # Execute code with device context
+        info = cumulus_manager.get_partition_info(partition_id) or {}
+        device_index = info.get('device', 0)
+        result = await executor.execute_with_cumulus(job_dir, job_id, partition_id, device_index=device_index)
         
         # Save result
         result_path = os.path.join(job_dir, "result.json")

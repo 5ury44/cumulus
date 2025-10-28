@@ -355,15 +355,22 @@ def get_checkpointer(job_id: str = None, use_distributed: bool = True, **kwargs)
 
 
 # Convenience functions for backward compatibility
-def save_checkpoint(model, optimizer, epoch: int, step: int, extra: dict = None, **kwargs):
-    """Save checkpoint using the appropriate checkpointer."""
+def save_checkpoint(model, optimizer=None, epoch: int = 0, step: int = 0, extra: dict = None, framework: str = None, **kwargs):
+    """Save checkpoint with unified, framework-agnostic API.
+
+    Uses distributed checkpointer when available; falls back to local.
+    """
     checkpointer = get_checkpointer(**kwargs)
+    if hasattr(checkpointer, 'save_checkpoint'):
+        return checkpointer.save_checkpoint(model=model, optimizer=optimizer, epoch=epoch, step=step, extra=extra, framework=framework)
     return checkpointer.save(model, optimizer, epoch, step, extra)
 
 
-def load_checkpoint(model, optimizer, checkpoint_path: str = None, **kwargs):
-    """Load checkpoint using the appropriate checkpointer."""
+def load_checkpoint(model=None, optimizer=None, checkpoint_path: str = None, framework: str = None, **kwargs):
+    """Load checkpoint with unified, framework-agnostic API."""
     checkpointer = get_checkpointer(**kwargs)
+    if hasattr(checkpointer, 'load_checkpoint'):
+        return checkpointer.load_checkpoint(model=model, optimizer=optimizer, checkpoint_path=checkpoint_path, framework=framework)
     return checkpointer.load(model, optimizer, checkpoint_path)
 
 
@@ -636,7 +643,6 @@ import os
 import json
 import time
 import socket
-import torch
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 import logging
@@ -711,8 +717,8 @@ class DistributedCheckpointer:
         self.metadata_key = f"jobs/{self.job_id}/metadata.json"
         
     def save(self, 
-             model: torch.nn.Module, 
-             optimizer: torch.optim.Optimizer, 
+             model, 
+             optimizer, 
              epoch: int, 
              step: int,
              extra: Dict[str, Any] = None) -> Dict[str, str]:
@@ -732,6 +738,7 @@ class DistributedCheckpointer:
         checkpoint_id = f"ckpt_{epoch}_{step}"
         
         # Create checkpoint data
+        import torch
         checkpoint = {
             'epoch': epoch,
             'step': step,
@@ -775,8 +782,8 @@ class DistributedCheckpointer:
         }
     
     def load(self, 
-             model: torch.nn.Module, 
-             optimizer: torch.optim.Optimizer,
+             model, 
+             optimizer,
              checkpoint_path: Optional[str] = None) -> Dict[str, Any]:
         """
         Load checkpoint from L1 or L2 cache.
@@ -800,6 +807,7 @@ class DistributedCheckpointer:
             raise FileNotFoundError(f"No checkpoint found at: {local_path}")
         
         # Load checkpoint
+        import torch
         state = torch.load(local_path, map_location='cpu')
         
         # Restore model and optimizer states
@@ -815,6 +823,177 @@ class DistributedCheckpointer:
         logger.info(f"📊 Resuming from epoch {state['epoch']}, step {state['step']}")
         
         return state
+
+    # -------------------------------
+    # Unified, framework-agnostic API
+    # -------------------------------
+    def _write_sidecar_metadata(self, data_file: str, framework: str, epoch: int, step: int, extra: Dict[str, Any]):
+        meta = {
+            'framework': framework,
+            'epoch': epoch,
+            'step': step,
+            'job_id': self.job_id,
+            'created_at': time.time(),
+            'extra': extra or {}
+        }
+        meta_path = f"{data_file}.meta.json"
+        try:
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+            if self.s3_client:
+                key = f"checkpoints/{self.job_id}/{os.path.basename(meta_path)}"
+                self.s3_client.upload_file(meta_path, self.s3_bucket, key)
+        except Exception:
+            pass
+
+    def _infer_framework_from_model(self, model) -> str:
+        mod = type(model).__module__ if model is not None else ''
+        if mod.startswith('torch.'):
+            return 'pytorch'
+        if mod.startswith(('tensorflow.', 'keras.')):
+            return 'tensorflow'
+        if mod.startswith('sklearn.'):
+            return 'sklearn'
+        if mod.startswith('xgboost.'):
+            return 'xgboost'
+        if mod.startswith('lightgbm.'):
+            return 'lightgbm'
+        return 'pytorch'
+
+    def save_checkpoint(self,
+                        model=None,
+                        optimizer=None,
+                        epoch: int = 0,
+                        step: int = 0,
+                        extra: Dict[str, Any] = None,
+                        framework: Optional[str] = None) -> Dict[str, Optional[str]]:
+        fw = (framework or self._infer_framework_from_model(model)).lower()
+        ckpt_id = f"ckpt_{epoch}_{step}"
+        if fw in ('pytorch', 'torch'):
+            info = self.save(model, optimizer, epoch, step, extra)
+            # ensure sidecar present
+            self._write_sidecar_metadata(info['local_path'], 'pytorch', epoch, step, extra or {})
+            return info
+        elif fw in ('tensorflow', 'tf', 'keras'):
+            # weights-only for TF/Keras
+            fname = f"{ckpt_id}.weights.h5"
+            local_path = os.path.join(self.local_dir, fname)
+            os.makedirs(self.local_dir, exist_ok=True)
+            model.save_weights(local_path)
+            self._write_sidecar_metadata(local_path, 'tensorflow', epoch, step, extra or {})
+            s3_key = None
+            if self.s3_client:
+                s3_key = f"checkpoints/{self.job_id}/{fname}"
+                try:
+                    self.s3_client.upload_file(local_path, self.s3_bucket, s3_key)
+                except Exception:
+                    s3_key = None
+            self._update_job_metadata(epoch, step, ckpt_id, local_path, s3_key)
+            return {'local_path': local_path, 's3_key': s3_key, 'checkpoint_id': ckpt_id}
+        elif fw == 'sklearn':
+            import joblib
+            fname = f"{ckpt_id}.pkl"
+            local_path = os.path.join(self.local_dir, fname)
+            os.makedirs(self.local_dir, exist_ok=True)
+            joblib.dump(model, local_path)
+            self._write_sidecar_metadata(local_path, 'sklearn', epoch, step, extra or {})
+            s3_key = None
+            if self.s3_client:
+                s3_key = f"checkpoints/{self.job_id}/{fname}"
+                try:
+                    self.s3_client.upload_file(local_path, self.s3_bucket, s3_key)
+                except Exception:
+                    s3_key = None
+            self._update_job_metadata(epoch, step, ckpt_id, local_path, s3_key)
+            return {'local_path': local_path, 's3_key': s3_key, 'checkpoint_id': ckpt_id}
+        elif fw == 'xgboost':
+            fname = f"{ckpt_id}.json"
+            local_path = os.path.join(self.local_dir, fname)
+            os.makedirs(self.local_dir, exist_ok=True)
+            model.save_model(local_path)
+            self._write_sidecar_metadata(local_path, 'xgboost', epoch, step, extra or {})
+            s3_key = None
+            if self.s3_client:
+                s3_key = f"checkpoints/{self.job_id}/{fname}"
+                try:
+                    self.s3_client.upload_file(local_path, self.s3_bucket, s3_key)
+                except Exception:
+                    s3_key = None
+            self._update_job_metadata(epoch, step, ckpt_id, local_path, s3_key)
+            return {'local_path': local_path, 's3_key': s3_key, 'checkpoint_id': ckpt_id}
+        elif fw == 'lightgbm':
+            fname = f"{ckpt_id}.txt"
+            local_path = os.path.join(self.local_dir, fname)
+            os.makedirs(self.local_dir, exist_ok=True)
+            model.save_model(local_path)
+            self._write_sidecar_metadata(local_path, 'lightgbm', epoch, step, extra or {})
+            s3_key = None
+            if self.s3_client:
+                s3_key = f"checkpoints/{self.job_id}/{fname}"
+                try:
+                    self.s3_client.upload_file(local_path, self.s3_bucket, s3_key)
+                except Exception:
+                    s3_key = None
+            self._update_job_metadata(epoch, step, ckpt_id, local_path, s3_key)
+            return {'local_path': local_path, 's3_key': s3_key, 'checkpoint_id': ckpt_id}
+        else:
+            # default to PyTorch behavior
+            info = self.save(model, optimizer, epoch, step, extra)
+            self._write_sidecar_metadata(info['local_path'], 'pytorch', epoch, step, extra or {})
+            return info
+
+    def load_checkpoint(self,
+                        model=None,
+                        optimizer=None,
+                        checkpoint_path: Optional[str] = None,
+                        framework: Optional[str] = None) -> Dict[str, Any]:
+        # Resolve path
+        local_path = (self._ensure_local_from_checkpoint_path(checkpoint_path)
+                      if checkpoint_path else self._find_latest_checkpoint())
+        if not local_path or not os.path.exists(local_path):
+            raise FileNotFoundError(f"No checkpoint found at: {local_path}")
+        fw = (framework or '').lower()
+        base = os.path.basename(local_path).lower()
+        if not fw:
+            if base.endswith('.pt'):
+                fw = 'pytorch'
+            elif base.endswith(('.h5', 'weights.h5')):
+                fw = 'tensorflow'
+            elif base.endswith('.pkl'):
+                fw = 'sklearn'
+            elif base.endswith('.json'):
+                fw = 'xgboost'
+            elif base.endswith('.txt'):
+                fw = 'lightgbm'
+            else:
+                fw = self._infer_framework_from_model(model)
+        if fw in ('pytorch', 'torch'):
+            state = self.load(model, optimizer, local_path)
+            return {'local_path': local_path, 'framework': 'pytorch', 'state': state}
+        elif fw in ('tensorflow', 'tf', 'keras'):
+            model.load_weights(local_path)
+            return {'local_path': local_path, 'framework': 'tensorflow', 'state': {'model': 'loaded'}}
+        elif fw == 'sklearn':
+            import joblib
+            obj = joblib.load(local_path)
+            return {'local_path': local_path, 'framework': 'sklearn', 'state': obj}
+        elif fw == 'xgboost':
+            import xgboost as xgb
+            booster = model or xgb.Booster()
+            booster.load_model(local_path)
+            return {'local_path': local_path, 'framework': 'xgboost', 'state': booster}
+        elif fw == 'lightgbm':
+            import lightgbm as lgb
+            if model is None:
+                booster = lgb.Booster(model_file=local_path)
+            else:
+                model.load_model(local_path)
+                booster = model
+            return {'local_path': local_path, 'framework': 'lightgbm', 'state': booster}
+        else:
+            # fallback to pytorch loader
+            state = self.load(model, optimizer, local_path)
+            return {'local_path': local_path, 'framework': 'pytorch', 'state': state}
 
     def _ensure_local_from_checkpoint_path(self, checkpoint_path: str) -> str:
         """Resolve a checkpoint path which may be:
