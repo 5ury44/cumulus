@@ -98,65 +98,8 @@ class DistributedCheckpointer:
              epoch: int, 
              step: int,
              extra: Dict[str, Any] = None) -> Dict[str, str]:
-        """
-        Save checkpoint to both L1 (local) and L2 (S3) caches.
-        
-        Args:
-            model: PyTorch model to checkpoint
-            optimizer: Optimizer to checkpoint
-            epoch: Current epoch number
-            step: Current step number
-            extra: Additional data to save
-            
-        Returns:
-            Dict with 'local_path' and 's3_key' of saved checkpoint
-        """
-        # Local import to avoid hard dependency at module import time
-        import torch
-        checkpoint_id = f"ckpt_{epoch}_{step}"
-        
-        # Create checkpoint data
-        checkpoint = {
-            'epoch': epoch,
-            'step': step,
-            'model': {k: v.detach().cpu() for k, v in model.state_dict().items()},
-            'optimizer': optimizer.state_dict(),
-            'rng_cpu': torch.random.get_rng_state(),
-            'rng_cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-            'extra': extra or {},
-            'metadata': {
-                'job_id': self.job_id,
-                'machine_id': self.machine_id,
-                'timestamp': time.time(),
-                'checkpoint_id': checkpoint_id,
-                'created_at': datetime.utcnow().isoformat()
-            }
-        }
-        
-        # Save to L1 cache (local)
-        local_path = os.path.join(self.local_dir, f"{checkpoint_id}.pt")
-        torch.save(checkpoint, local_path)
-        logger.info(f"✅ Checkpoint saved to L1 cache: {local_path}")
-        
-        # Save to L2 cache (S3) if available
-        s3_key = None
-        if self.s3_client:
-            s3_key = f"checkpoints/{self.job_id}/{checkpoint_id}.pt"
-            try:
-                self.s3_client.upload_file(local_path, self.s3_bucket, s3_key)
-                logger.info(f"✅ Checkpoint synced to L2 cache: s3://{self.s3_bucket}/{s3_key}")
-            except Exception as e:
-                logger.error(f"❌ Failed to sync checkpoint to S3: {e}")
-                s3_key = None
-        
-        # Update job metadata
-        self._update_job_metadata(epoch, step, checkpoint_id, local_path, s3_key)
-        
-        return {
-            'local_path': local_path,
-            's3_key': s3_key,
-            'checkpoint_id': checkpoint_id
-        }
+        """Deprecated. Use save_checkpoint instead."""
+        raise RuntimeError("DistributedCheckpointer.save() is removed. Use save_checkpoint()")
 
     # -------------------------------
     # Unified, framework-agnostic API
@@ -265,45 +208,8 @@ class DistributedCheckpointer:
              model: Any, 
              optimizer: Any,
              checkpoint_path: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Load checkpoint from L1 or L2 cache.
-        
-        Args:
-            model: PyTorch model to load state into
-            optimizer: Optimizer to load state into
-            checkpoint_path: Specific checkpoint path (optional)
-            
-        Returns:
-            Loaded checkpoint state
-        """
-        if checkpoint_path:
-            # Load specific checkpoint
-            local_path = self._ensure_local_from_checkpoint_path(checkpoint_path)
-        else:
-            # Find latest checkpoint
-            local_path = self._find_latest_checkpoint()
-        
-        if not local_path or not os.path.exists(local_path):
-            raise FileNotFoundError(f"No checkpoint found at: {local_path}")
-        
-        # Local import to avoid hard dependency at module import time
-        import torch
-        # Load checkpoint
-        state = torch.load(local_path, map_location='cpu')
-        
-        # Restore model and optimizer states
-        model.load_state_dict(state['model'])
-        optimizer.load_state_dict(state['optimizer'])
-        
-        # Restore RNG states
-        torch.random.set_rng_state(state['rng_cpu'])
-        if torch.cuda.is_available() and state.get('rng_cuda') is not None:
-            torch.cuda.set_rng_state_all(state['rng_cuda'])
-        
-        logger.info(f"✅ Checkpoint loaded from: {local_path}")
-        logger.info(f"📊 Resuming from epoch {state['epoch']}, step {state['step']}")
-        
-        return state
+        """Deprecated. Use load_checkpoint instead."""
+        raise RuntimeError("DistributedCheckpointer.load() is removed. Use load_checkpoint()")
 
     def _ensure_local_from_checkpoint_path(self, checkpoint_path: str) -> str:
         """Resolve a checkpoint path which may be:

@@ -271,6 +271,17 @@ class Checkpointer:
             torch.cuda.set_rng_state_all(state['rng_cuda'])
         return state
 
+    # Unified wrappers for local checkpoints
+    def save_checkpoint(self, model, optimizer=None, epoch: int = 0, step: int = 0, extra: dict = None, framework: str = None):
+        path = self.save(model, optimizer, epoch, step, extra)
+        return {"local_path": path, "s3_key": None, "checkpoint_id": f"ckpt_{epoch}_{step}"}
+
+    def load_checkpoint(self, model=None, optimizer=None, checkpoint_path: str = None, framework: str = None):
+        if checkpoint_path:
+            self.path = checkpoint_path
+        state = self.load(model, optimizer) if (model is not None and optimizer is not None) else torch.load(self.path, map_location='cpu')
+        return {"local_path": self.path, "framework": (framework or "pytorch"), "state": state}
+
     def time_to_checkpoint(self, step: int, every_steps: int = None, every_seconds: int = None):
         """Check if it's time to checkpoint."""
         by_step = (every_steps is not None and step > 0 and step % every_steps == 0)
@@ -354,24 +365,17 @@ def get_checkpointer(job_id: str = None, use_distributed: bool = True, **kwargs)
     return Checkpointer()
 
 
-# Convenience functions for backward compatibility
+# Unified convenience functions
 def save_checkpoint(model, optimizer=None, epoch: int = 0, step: int = 0, extra: dict = None, framework: str = None, **kwargs):
-    """Save checkpoint with unified, framework-agnostic API.
-
-    Uses distributed checkpointer when available; falls back to local.
-    """
+    """Save checkpoint with unified, framework-agnostic API."""
     checkpointer = get_checkpointer(**kwargs)
-    if hasattr(checkpointer, 'save_checkpoint'):
-        return checkpointer.save_checkpoint(model=model, optimizer=optimizer, epoch=epoch, step=step, extra=extra, framework=framework)
-    return checkpointer.save(model, optimizer, epoch, step, extra)
+    return checkpointer.save_checkpoint(model=model, optimizer=optimizer, epoch=epoch, step=step, extra=extra, framework=framework)
 
 
 def load_checkpoint(model=None, optimizer=None, checkpoint_path: str = None, framework: str = None, **kwargs):
     """Load checkpoint with unified, framework-agnostic API."""
     checkpointer = get_checkpointer(**kwargs)
-    if hasattr(checkpointer, 'load_checkpoint'):
-        return checkpointer.load_checkpoint(model=model, optimizer=optimizer, checkpoint_path=checkpoint_path, framework=framework)
-    return checkpointer.load(model, optimizer, checkpoint_path)
+    return checkpointer.load_checkpoint(model=model, optimizer=optimizer, checkpoint_path=checkpoint_path, framework=framework)
 
 
 def find_latest_checkpoint(**kwargs):
@@ -411,7 +415,8 @@ class _SaveOnInterrupt:
             try:
                 epoch = int(self.get_epoch())
                 step = int(self.get_step())
-                self.checkpointer.save(self.model, self.optimizer, epoch, step)
+                # Always use unified API
+                self.checkpointer.save_checkpoint(model=self.model, optimizer=self.optimizer, epoch=epoch, step=step, framework="pytorch")
             except Exception:
                 pass
             if signum == signal.SIGINT:
@@ -870,10 +875,31 @@ class DistributedCheckpointer:
         fw = (framework or self._infer_framework_from_model(model)).lower()
         ckpt_id = f"ckpt_{epoch}_{step}"
         if fw in ('pytorch', 'torch'):
-            info = self.save(model, optimizer, epoch, step, extra)
-            # ensure sidecar present
-            self._write_sidecar_metadata(info['local_path'], 'pytorch', epoch, step, extra or {})
-            return info
+            # Save PyTorch checkpoint without legacy API
+            fname = f"{ckpt_id}.pt"
+            local_path = os.path.join(self.local_dir, fname)
+            os.makedirs(self.local_dir, exist_ok=True)
+            import torch
+            state = {
+                'epoch': epoch,
+                'step': step,
+                'model': {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                'optimizer': optimizer.state_dict() if optimizer is not None else {},
+                'rng_cpu': torch.random.get_rng_state(),
+                'rng_cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                'extra': extra or {}
+            }
+            torch.save(state, local_path)
+            self._write_sidecar_metadata(local_path, 'pytorch', epoch, step, extra or {})
+            s3_key = None
+            if self.s3_client:
+                s3_key = f"checkpoints/{self.job_id}/{fname}"
+                try:
+                    self.s3_client.upload_file(local_path, self.s3_bucket, s3_key)
+                except Exception:
+                    s3_key = None
+            self._update_job_metadata(epoch, step, ckpt_id, local_path, s3_key)
+            return {'local_path': local_path, 's3_key': s3_key, 'checkpoint_id': ckpt_id}
         elif fw in ('tensorflow', 'tf', 'keras'):
             # weights-only for TF/Keras
             fname = f"{ckpt_id}.weights.h5"
@@ -937,10 +963,31 @@ class DistributedCheckpointer:
             self._update_job_metadata(epoch, step, ckpt_id, local_path, s3_key)
             return {'local_path': local_path, 's3_key': s3_key, 'checkpoint_id': ckpt_id}
         else:
-            # default to PyTorch behavior
-            info = self.save(model, optimizer, epoch, step, extra)
-            self._write_sidecar_metadata(info['local_path'], 'pytorch', epoch, step, extra or {})
-            return info
+            # Default to PyTorch behavior via unified path
+            fname = f"{ckpt_id}.pt"
+            local_path = os.path.join(self.local_dir, fname)
+            os.makedirs(self.local_dir, exist_ok=True)
+            import torch
+            state = {
+                'epoch': epoch,
+                'step': step,
+                'model': {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                'optimizer': optimizer.state_dict() if optimizer is not None else {},
+                'rng_cpu': torch.random.get_rng_state(),
+                'rng_cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                'extra': extra or {}
+            }
+            torch.save(state, local_path)
+            self._write_sidecar_metadata(local_path, 'pytorch', epoch, step, extra or {})
+            s3_key = None
+            if self.s3_client:
+                s3_key = f"checkpoints/{self.job_id}/{fname}"
+                try:
+                    self.s3_client.upload_file(local_path, self.s3_bucket, s3_key)
+                except Exception:
+                    s3_key = None
+            self._update_job_metadata(epoch, step, ckpt_id, local_path, s3_key)
+            return {'local_path': local_path, 's3_key': s3_key, 'checkpoint_id': ckpt_id}
 
     def load_checkpoint(self,
                         model=None,
