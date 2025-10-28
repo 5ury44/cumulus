@@ -204,6 +204,14 @@ try:
 except ImportError:
     DISTRIBUTED_CHECKPOINTING_AVAILABLE = False
 
+# Optional boto3 import for S3 artifact storage
+try:
+    import boto3
+    _BOTO3_AVAILABLE = True
+except Exception:
+    boto3 = None
+    _BOTO3_AVAILABLE = False
+
 
 def job_dir():
     """Get the job directory from environment variable."""
@@ -481,12 +489,137 @@ class LocalArtifactStore:
         return sorted(items, key=lambda x: x['timestamp'], reverse=True)
 
 
+class S3ArtifactStore(LocalArtifactStore):
+    """S3-backed artifact store (L2) with optional local L1 cache."""
+
+    def __init__(self,
+                 job_id: Optional[str] = None,
+                 s3_bucket: Optional[str] = None,
+                 s3_region: Optional[str] = None,
+                 local_dir: Optional[str] = None,
+                 aws_access_key_id: Optional[str] = None,
+                 aws_secret_access_key: Optional[str] = None):
+        # Use local L1 for caching and mirroring writes
+        super().__init__(local_dir=local_dir or os.getenv('CUMULUS_LOCAL_CACHE_DIR', job_dir()))
+        self.job_id = job_id or os.getenv('CUMULUS_JOB_ID') or 'unknown_job'
+        self.s3_bucket = s3_bucket or os.getenv('CUMULUS_S3_BUCKET')
+        self.s3_region = s3_region or os.getenv('CUMULUS_S3_REGION', 'us-east-1')
+
+        self.s3_client = None
+        if _BOTO3_AVAILABLE and self.s3_bucket:
+            try:
+                session = boto3.Session(
+                    aws_access_key_id=aws_access_key_id or os.getenv('AWS_ACCESS_KEY_ID'),
+                    aws_secret_access_key=aws_secret_access_key or os.getenv('AWS_SECRET_ACCESS_KEY'),
+                    region_name=self.s3_region
+                )
+                self.s3_client = session.client('s3')
+            except Exception:
+                self.s3_client = None
+
+    def _s3_key(self, name: str) -> str:
+        safe_name = os.path.basename(name)
+        return f"artifacts/{self.job_id}/{safe_name}"
+
+    def save_artifact_file(self, name: str, src_path: str) -> Dict[str, Optional[str]]:
+        info = super().save_artifact_file(name, src_path)
+        s3_key = None
+        if self.s3_client and self.s3_bucket:
+            try:
+                s3_key = self._s3_key(name)
+                self.s3_client.upload_file(info['local_path'], self.s3_bucket, s3_key)
+            except Exception:
+                s3_key = None
+        return {"local_path": info['local_path'], "s3_key": s3_key}
+
+    def save_artifact_bytes(self, name: str, data: bytes) -> Dict[str, Optional[str]]:
+        info = super().save_artifact_bytes(name, data)
+        s3_key = None
+        if self.s3_client and self.s3_bucket:
+            try:
+                s3_key = self._s3_key(name)
+                import io
+                self.s3_client.upload_fileobj(io.BytesIO(data), self.s3_bucket, s3_key)
+            except Exception:
+                s3_key = None
+        return {"local_path": info['local_path'], "s3_key": s3_key}
+
+    def load_artifact_to_path(self, name: str, dst_path: Optional[str] = None) -> str:
+        # Try local first
+        try:
+            return super().load_artifact_to_path(name, dst_path)
+        except FileNotFoundError:
+            pass
+
+        # Fallback to S3
+        if not (self.s3_client and self.s3_bucket):
+            raise FileNotFoundError(f"Artifact not found locally and S3 not configured: {name}")
+
+        s3_key = self._s3_key(name)
+        local_target = dst_path or self._artifact_local_path(name)
+        os.makedirs(os.path.dirname(local_target), exist_ok=True)
+        try:
+            self.s3_client.download_file(self.s3_bucket, s3_key, local_target)
+            return local_target
+        except Exception as e:
+            raise FileNotFoundError(f"Failed to download artifact from S3 {s3_key}: {e}")
+
+    def load_artifact_bytes(self, name: str) -> bytes:
+        # Try local first
+        try:
+            return super().load_artifact_bytes(name)
+        except Exception:
+            pass
+
+        # Fallback to S3
+        if not (self.s3_client and self.s3_bucket):
+            raise FileNotFoundError(f"Artifact not found locally and S3 not configured: {name}")
+
+        s3_key = self._s3_key(name)
+        try:
+            obj = self.s3_client.get_object(Bucket=self.s3_bucket, Key=s3_key)
+            return obj['Body'].read()
+        except Exception as e:
+            raise FileNotFoundError(f"Failed to load artifact from S3 {s3_key}: {e}")
+
+    def list_artifacts(self, prefix: Optional[str] = None) -> List[Dict[str, Any]]:
+        # Start with local list
+        items = super().list_artifacts(prefix)
+
+        # Merge with S3 list if available
+        if self.s3_client and self.s3_bucket:
+            try:
+                s3_prefix = f"artifacts/{self.job_id}/"
+                if prefix:
+                    s3_prefix = s3_prefix + prefix
+                resp = self.s3_client.list_objects_v2(Bucket=self.s3_bucket, Prefix=s3_prefix)
+                if 'Contents' in resp:
+                    for obj in resp['Contents']:
+                        fname = os.path.basename(obj['Key'])
+                        if not fname:
+                            continue
+                        items.append({
+                            'name': fname,
+                            'path': f"s3://{self.s3_bucket}/{obj['Key']}",
+                            'source': 'L2 (S3)',
+                            'timestamp': obj['LastModified'].timestamp()
+                        })
+            except Exception:
+                pass
+        # Newest first
+        return sorted(items, key=lambda x: x['timestamp'], reverse=True)
+
+
 def get_artifact_store(job_id: str = None, use_distributed: bool = True, **kwargs):
-    """Get distributed artifact store if available, else local store."""
+    """Get S3 artifact store if configured, else local store.
+
+    If use_distributed is True and S3 is configured, returns S3ArtifactStore.
+    Otherwise returns LocalArtifactStore.
+    """
     if use_distributed:
-        dc = get_distributed_checkpointer(job_id, **kwargs)
-        if dc:
-            return dc
+        # Prefer S3 artifact store if configured
+        if _BOTO3_AVAILABLE and os.getenv('CUMULUS_S3_BUCKET'):
+            return S3ArtifactStore(job_id=job_id, **kwargs)
     return LocalArtifactStore()
 '''
     

@@ -14,21 +14,28 @@ def test_artifact_store():
     """Test that users can save/load their own artifacts."""
     from runtime import get_artifact_store
     import json
+    import os
     
-    # Get artifact store (will use LocalArtifactStore since no S3 configured)
-    store = get_artifact_store(use_distributed=False)
+    # Prefer distributed (S3) artifact store when configured
+    store = get_artifact_store(use_distributed=True)
     
     # Test 1: Save bytes as artifact
     print("📦 Test 1: Saving bytes as artifact")
     data = b"Hello from artifact store!"
     info = store.save_artifact_bytes("hello.txt", data)
     print(f"✅ Saved to: {info['local_path']}")
+    if os.getenv('CUMULUS_S3_BUCKET'):
+        print(f"🪣 S3 key: {info.get('s3_key')}")
+        assert info.get('s3_key'), "Expected S3 key for artifact when CUMULUS_S3_BUCKET is set"
     
     # Test 2: Save JSON as bytes
     print("\n📦 Test 2: Saving JSON data")
     json_data = json.dumps({"test": "data", "value": 42}).encode('utf-8')
     info2 = store.save_artifact_bytes("test.json", json_data)
     print(f"✅ Saved to: {info2['local_path']}")
+    if os.getenv('CUMULUS_S3_BUCKET'):
+        print(f"🪣 S3 key: {info2.get('s3_key')}")
+        assert info2.get('s3_key'), "Expected S3 key for artifact when CUMULUS_S3_BUCKET is set"
     
     # Test 3: Load artifact as bytes
     print("\n📦 Test 3: Loading artifact as bytes")
@@ -41,11 +48,14 @@ def test_artifact_store():
     print(f"✅ Found {len(artifacts)} artifacts:")
     for art in artifacts:
         print(f"  - {art['name']} ({art['source']})")
+    if os.getenv('CUMULUS_S3_BUCKET'):
+        assert any(a.get('source') == 'L2 (S3)' for a in artifacts), "Expected to list at least one S3 artifact"
     
     return {
         'status': 'completed',
         'num_artifacts': len(artifacts),
-        'message': 'Artifact store tests passed!'
+        'message': 'Artifact store tests passed!',
+        's3_enabled': bool(os.getenv('CUMULUS_S3_BUCKET')),
     }
 
 
