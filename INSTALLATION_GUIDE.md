@@ -50,7 +50,7 @@ mkdir -p /opt && cd /opt
 git clone https://github.com/5ury44/cumulus.git
 
 # Build & install Chronos GPU partitioner
-cd /opt/cumulus/chronos_core
+cd /opt/cumulus/cumulus_core
 bash scripts/install-quick.sh
 
 # Verify Chronos CLI
@@ -126,7 +126,7 @@ sudo apt update && sudo apt upgrade -y
 sudo apt install -y python3 python3-pip python3-venv
 
 # Build Chronos from source (if skipping quick setup above)
-cd /opt/cumulus/chronos_core
+cd /opt/cumulus/cumulus_core
 bash scripts/install-quick.sh
 ```
 

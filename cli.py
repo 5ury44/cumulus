@@ -42,7 +42,7 @@ def _resolve_chronos_path() -> Optional[str]:
 
     # Vendored path
     here = os.path.dirname(__file__)
-    vendored = os.path.join(here, "chronos_vendor", "bin", "chronos_cli")
+    vendored = os.path.join(here, "cumulus_vendor", "bin", "chronos_cli")
     if os.path.isfile(vendored) and os.access(vendored, os.X_OK):
         return vendored
 

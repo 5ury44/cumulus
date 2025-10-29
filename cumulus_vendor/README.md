@@ -9,7 +9,7 @@ This directory vendors the Chronos GPU partitioner so Cumulus can run without a 
 2. Build Chronos:
 
    ```bash
-   cd cumulus/chronos_vendor/chronos
+   cd cumulus/cumulus_vendor/chronos
    mkdir -p build && cd build
    cmake .. -DCMAKE_BUILD_TYPE=Release
    make -j
@@ -37,7 +37,7 @@ This directory vendors the Chronos GPU partitioner so Cumulus can run without a 
 `cumulus.worker.CumulusManager` resolves the CLI path in this order:
 
 1. `CUMULUS_CHRONOS_PATH` (if executable)
-2. `cumulus/chronos_vendor/bin/chronos_cli` (if present)
+2. `cumulus/cumulus_vendor/bin/chronos_cli` (if present)
 3. System path `/usr/local/bin/chronos_cli`
 
 ## Notes

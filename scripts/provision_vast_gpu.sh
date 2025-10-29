@@ -94,7 +94,7 @@ else
 fi
 
 echo "[3/8] Building Chronos (GPU partitioner)..."
-pushd "${INSTALL_DIR}/chronos_core" >/dev/null
+pushd "${INSTALL_DIR}/cumulus_core" >/dev/null
 bash scripts/install-quick.sh
 popd >/dev/null
 

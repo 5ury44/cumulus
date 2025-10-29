@@ -25,7 +25,7 @@ python3 -m venv cumulus-env && source cumulus-env/bin/activate
 pip install -e .
 
 # Option A: build vendored Chronos and let cumulus discover it
-#   (see cumulus/chronos_vendor/README.md)
+#   (see cumulus/cumulus_vendor/README.md)
 
 # Start the worker
 cumulus-cli serve --host 0.0.0.0 --port 8080

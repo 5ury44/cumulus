@@ -51,7 +51,7 @@ def complete_nn_training_and_resume():
         print(f"📦 S3 Bucket: {checkpointer.s3_bucket}")
     
     # Training loop - first 3 epochs
-    epochs = 5
+    epochs = 15
     batch_size = 64
     
     print(f"\n📋 Phase 1: Training first 3 epochs")
