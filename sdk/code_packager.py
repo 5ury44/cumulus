@@ -97,6 +97,7 @@ import sys
 import json
 import os
 import traceback
+import runtime
 from function import {func.__name__}
 
 def main():
@@ -109,6 +110,9 @@ def main():
         print(f"🚀 Starting job {{config['job_id']}}")
         print(f"Function: {{config['function_name']}}")
         
+        # Ensure auto-checkpoint hooks are initialized
+        runtime.get_auto_checkpoint_manager()
+
         # Import and call the function
         args = config.get('args', [])
         kwargs = config.get('kwargs', {{}})
@@ -119,6 +123,18 @@ def main():
             json.dump(result, f, indent=2, default=str)
         
         print("✅ Job completed successfully")
+        
+    except runtime.CooperativePause as pause:
+        pause_info = runtime.get_last_checkpoint_info() or {{}}
+        pause_payload = {{
+            'status': 'paused',
+            'reason': str(pause) or 'pause requested',
+            'checkpoint': pause_info
+        }}
+        with open('result.json', 'w') as f:
+            json.dump(pause_payload, f, indent=2, default=str)
+        print("⏸️ Job paused cooperatively")
+        sys.exit(0)
         
     except Exception as e:
         error_info = {{
@@ -194,7 +210,13 @@ import os
 import json
 import time
 import signal
-import torch
+import importlib
+import importlib.util
+import weakref
+try:
+    import torch
+except Exception:
+    torch = None
 from typing import Dict, Any, Optional, List, Callable
 
 # Import distributed checkpointing if available
@@ -248,6 +270,8 @@ class Checkpointer:
 
     def save(self, model, optimizer, epoch: int, step: int, extra: dict = None):
         """Save model checkpoint."""
+        if torch is None:
+            raise RuntimeError("PyTorch is required for local checkpointing")
         state = {
             'epoch': epoch,
             'step': step,
@@ -263,6 +287,8 @@ class Checkpointer:
 
     def load(self, model, optimizer):
         """Load model checkpoint."""
+        if torch is None:
+            raise RuntimeError("PyTorch is required for local checkpointing")
         state = torch.load(self.path, map_location='cpu')
         model.load_state_dict(state['model'])
         optimizer.load_state_dict(state['optimizer'])
@@ -291,6 +317,8 @@ class Checkpointer:
 
 def list_checkpoints() -> List[Dict[str, Any]]:
     """List available checkpoints in the job directory."""
+    if torch is None:
+        return []
     checkpoints = []
     job_d = job_dir()
     
@@ -310,6 +338,21 @@ def list_checkpoints() -> List[Dict[str, Any]]:
                 continue
     
     return sorted(checkpoints, key=lambda x: x['timestamp'], reverse=True)
+
+
+_LAST_CHECKPOINT_INFO: Optional[Dict[str, Any]] = None
+
+
+def _update_last_checkpoint(info: Optional[Dict[str, Any]]):
+    """Store metadata about the most recent checkpoint save."""
+    global _LAST_CHECKPOINT_INFO
+    if info is not None:
+        _LAST_CHECKPOINT_INFO = info
+
+
+def get_last_checkpoint_info() -> Optional[Dict[str, Any]]:
+    """Retrieve metadata for the most recently saved checkpoint."""
+    return _LAST_CHECKPOINT_INFO
 
 
 def get_distributed_checkpointer(job_id: str = None, **kwargs) -> Optional[DistributedCheckpointer]:
@@ -369,7 +412,9 @@ def get_checkpointer(job_id: str = None, use_distributed: bool = True, **kwargs)
 def save_checkpoint(model, optimizer=None, epoch: int = 0, step: int = 0, extra: dict = None, framework: str = None, **kwargs):
     """Save checkpoint with unified, framework-agnostic API."""
     checkpointer = get_checkpointer(**kwargs)
-    return checkpointer.save_checkpoint(model=model, optimizer=optimizer, epoch=epoch, step=step, extra=extra, framework=framework)
+    info = checkpointer.save_checkpoint(model=model, optimizer=optimizer, epoch=epoch, step=step, extra=extra, framework=framework)
+    _update_last_checkpoint(info)
+    return info
 
 
 def load_checkpoint(model=None, optimizer=None, checkpoint_path: str = None, framework: str = None, **kwargs):
@@ -633,6 +678,515 @@ def get_artifact_store(job_id: str = None, use_distributed: bool = True, **kwarg
         if _BOTO3_AVAILABLE and os.getenv('CUMULUS_S3_BUCKET'):
             return S3ArtifactStore(job_id=job_id, **kwargs)
     return LocalArtifactStore()
+
+
+class CooperativePause(RuntimeError):
+    """Raised when cooperative pause is requested via control signal."""
+
+
+class AutoCheckpointManager:
+    """Coordinates transparent checkpointing for supported frameworks."""
+
+    def __init__(self):
+        self.enabled = os.getenv('CUMULUS_AUTO_CHECKPOINT', 'true').lower() not in ('0', 'false', 'no', 'off')
+        try:
+            self.every_steps = int(os.getenv('CUMULUS_CHECKPOINT_EVERY_STEPS', '0') or '0')
+        except Exception:
+            self.every_steps = 0
+        try:
+            self.every_seconds = float(os.getenv('CUMULUS_CHECKPOINT_EVERY_SECONDS', '0') or '0')
+        except Exception:
+            self.every_seconds = 0.0
+
+        if self.every_steps <= 0:
+            self.every_steps = 100
+        if self.every_seconds < 0:
+            self.every_seconds = 0.0
+
+        self.checkpointer = None
+        self.distributed = False
+        self._torch_param_to_module = weakref.WeakKeyDictionary()
+        self._torch_optimizer_state = weakref.WeakKeyDictionary()
+        self.framework_state: Dict[str, Dict[str, Any]] = {}
+        self._resume_cache: Dict[str, Optional[str]] = {}
+        self._paused_frameworks: Dict[str, bool] = {}
+        self.last_checkpoint_info: Optional[Dict[str, Any]] = None
+
+        if not self.enabled:
+            return
+
+        try:
+            self.checkpointer = get_checkpointer()
+            self.distributed = not isinstance(self.checkpointer, Checkpointer)
+        except Exception as exc:
+            print(f"[cumulus.auto] Failed to initialize checkpointer: {exc}")
+            self.enabled = False
+            return
+
+        self._enable_frameworks()
+
+    def _enable_frameworks(self):
+        self._safe_enable('pytorch', self._enable_torch)
+        if self.distributed:
+            self._safe_enable('tensorflow', self._enable_tensorflow)
+            self._safe_enable('sklearn', self._enable_sklearn)
+            self._safe_enable('xgboost', self._enable_xgboost)
+            self._safe_enable('lightgbm', self._enable_lightgbm)
+
+    def _safe_enable(self, name: str, func: Callable[[], None]):
+        try:
+            func()
+        except Exception as exc:
+            print(f"[cumulus.auto] Failed to enable {name} auto-checkpointing: {exc}")
+
+    @staticmethod
+    def _module_available(module_name: str) -> bool:
+        try:
+            return importlib.util.find_spec(module_name) is not None
+        except Exception:
+            return False
+
+    def _framework_state_for(self, name: str) -> Dict[str, Any]:
+        state = self.framework_state.setdefault(name, {})
+        state.setdefault('step', 0)
+        state.setdefault('last_ts', time.time())
+        state.setdefault('resumed', False)
+        return state
+
+    def _record_checkpoint(self, info: Optional[Dict[str, Any]]):
+        if info:
+            self.last_checkpoint_info = info
+            _update_last_checkpoint(info)
+
+    def _should_save(self, step: int, last_ts: float) -> bool:
+        save_by_step = self.every_steps and step > 0 and (step % self.every_steps == 0)
+        save_by_time = self.every_seconds and ((time.time() - last_ts) >= self.every_seconds)
+        return bool(save_by_step or save_by_time)
+
+    def _record_pause(self, framework: str):
+        self._paused_frameworks[framework] = True
+
+    def pause_requested(self, framework: Optional[str] = None) -> bool:
+        if framework:
+            return self._paused_frameworks.get(framework, False)
+        return any(self._paused_frameworks.values())
+
+    def _raise_pause(self):
+        raise CooperativePause("Pause requested by Cumulus scheduler")
+
+    def _latest_checkpoint(self, framework: str) -> Optional[str]:
+        if framework in self._resume_cache:
+            return self._resume_cache[framework]
+        if hasattr(self.checkpointer, 'list_checkpoints'):
+            try:
+                entries = self.checkpointer.list_checkpoints()
+            except Exception:
+                entries = []
+            for item in entries:
+                meta = item.get('metadata') or {}
+                fw = (meta.get('framework') or item.get('framework') or '').lower()
+                if fw == framework:
+                    path = item.get('path')
+                    if path:
+                        self._resume_cache[framework] = path
+                        return path
+                    s3_key = item.get('s3_key')
+                    if s3_key:
+                        self._resume_cache[framework] = s3_key
+                        return s3_key
+            return None
+        return None
+
+    def _enable_torch(self):
+        if torch is None:
+            return
+        module_cls = torch.nn.Module
+        if getattr(module_cls, "_cumulus_auto_ckpt", False):
+            return
+        manager = self
+
+        original_add_module = module_cls.add_module
+        original_register_parameter = module_cls._register_parameter
+
+        def add_module_wrapper(self_module, name, module):
+            result = original_add_module(self_module, name, module)
+            if module is not None:
+                try:
+                    setattr(module, "_cumulus_parent", self_module)
+                except Exception:
+                    pass
+            return result
+
+        def register_parameter_wrapper(self_module, name, param):
+            result = original_register_parameter(self_module, name, param)
+            if param is not None:
+                try:
+                    manager._torch_param_to_module[param] = self_module
+                except Exception:
+                    pass
+            return result
+
+        module_cls.add_module = add_module_wrapper
+        module_cls._register_parameter = register_parameter_wrapper
+        module_cls._cumulus_auto_ckpt = True
+
+        opt_cls = torch.optim.Optimizer
+        if getattr(opt_cls, "_cumulus_auto_ckpt", False):
+            return
+        original_init = opt_cls.__init__
+        original_step = opt_cls.step
+
+        def init_wrapper(opt_self, params, defaults):
+            original_init(opt_self, params, defaults)
+            manager._register_torch_optimizer(opt_self)
+
+        def step_wrapper(opt_self, *args, **kwargs):
+            result = original_step(opt_self, *args, **kwargs)
+            manager._after_torch_step(opt_self)
+            return result
+
+        opt_cls.__init__ = init_wrapper
+        opt_cls.step = step_wrapper
+        opt_cls._cumulus_auto_ckpt = True
+
+    def _register_torch_optimizer(self, optimizer):
+        if optimizer in self._torch_optimizer_state:
+            return
+        state = {'step': 0, 'last_ts': time.time(), 'model': None, 'resumed': False}
+        self._torch_optimizer_state[optimizer] = state
+        model = self._infer_torch_model(optimizer)
+        if model is not None:
+            state['model'] = model
+            self._maybe_resume_torch(model, optimizer, state)
+
+    def _infer_torch_model(self, optimizer):
+        modules = []
+        for group in getattr(optimizer, 'param_groups', []):
+            for param in group.get('params', []):
+                module = self._torch_param_to_module.get(param)
+                if module is None:
+                    continue
+                root = module
+                visited = set()
+                while hasattr(root, "_cumulus_parent") and getattr(root, "_cumulus_parent") is not None and root not in visited:
+                    visited.add(root)
+                    root = getattr(root, "_cumulus_parent")
+                if root not in modules:
+                    modules.append(root)
+        if len(modules) == 1:
+            return modules[0]
+        if modules:
+            try:
+                return modules[0]
+            except Exception:
+                return None
+        return None
+
+    def _maybe_resume_torch(self, model, optimizer, state):
+        if state.get('resumed'):
+            return
+        try:
+            if isinstance(self.checkpointer, Checkpointer):
+                if self.checkpointer.exists():
+                    info = self.checkpointer.load_checkpoint(model=model, optimizer=optimizer, framework="pytorch")
+                    state['step'] = info['state'].get('step', 0)
+                    state['last_ts'] = time.time()
+                    self._record_checkpoint(info)
+            else:
+                path = self._latest_checkpoint('pytorch')
+                if path:
+                    info = self.checkpointer.load_checkpoint(model=model, optimizer=optimizer, checkpoint_path=path, framework="pytorch")
+                    state['step'] = info['state'].get('step', 0)
+                    state['last_ts'] = time.time()
+                    self._record_checkpoint(info)
+        except Exception as exc:
+            print(f"[cumulus.auto] Failed to resume PyTorch checkpoint: {exc}")
+        state['resumed'] = True
+
+    def _save_torch_checkpoint(self, model, optimizer, step):
+        if model is None:
+            return None
+        try:
+            info = self.checkpointer.save_checkpoint(model=model, optimizer=optimizer, epoch=0, step=step, framework="pytorch", extra={'auto': True})
+            self._record_checkpoint(info)
+            return info
+        except Exception as exc:
+            print(f"[cumulus.auto] Failed to save PyTorch checkpoint: {exc}")
+            return None
+
+    def _after_torch_step(self, optimizer):
+        if optimizer not in self._torch_optimizer_state:
+            self._register_torch_optimizer(optimizer)
+        state = self._torch_optimizer_state.get(optimizer)
+        if not state:
+            return
+        state['step'] += 1
+        if state.get('model') is None:
+            state['model'] = self._infer_torch_model(optimizer)
+            if state['model'] is not None:
+                self._maybe_resume_torch(state['model'], optimizer, state)
+        model = state.get('model')
+        if model is None:
+            return
+        if self._should_save(state['step'], state.get('last_ts', 0.0)):
+            info = self._save_torch_checkpoint(model, optimizer, state['step'])
+            if info:
+                state['last_ts'] = time.time()
+        if should_pause():
+            info = self._save_torch_checkpoint(model, optimizer, state['step'])
+            if info:
+                state['last_ts'] = time.time()
+            self._record_pause('pytorch')
+            self._raise_pause()
+
+    def _enable_tensorflow(self):
+        if not self._module_available('tensorflow'):
+            return
+        import tensorflow as tf
+        if getattr(tf.keras.Model, "_cumulus_auto_ckpt", False):
+            return
+        manager = self
+
+        class AutoCheckpointCallback(tf.keras.callbacks.Callback):
+            def __init__(self):
+                super().__init__()
+                self._total_step = 0
+
+            def on_train_begin(self, logs=None):
+                manager._tf_before_train(self.model)
+
+            def on_train_batch_end(self, batch, logs=None):
+                self._total_step += 1
+                manager._tf_after_batch(self.model, self._total_step)
+
+        original_fit = tf.keras.Model.fit
+
+        def fit_wrapper(model_self, *args, **kwargs):
+            if not manager.enabled:
+                return original_fit(model_self, *args, **kwargs)
+            callbacks = list(kwargs.get('callbacks') or [])
+            if not any(isinstance(cb, AutoCheckpointCallback) for cb in callbacks):
+                callbacks.append(AutoCheckpointCallback())
+            kwargs['callbacks'] = callbacks
+            result = original_fit(model_self, *args, **kwargs)
+            if manager.pause_requested('tensorflow'):
+                manager._raise_pause()
+            return result
+
+        tf.keras.Model.fit = fit_wrapper
+        tf.keras.Model._cumulus_auto_ckpt = True
+
+    def _tf_before_train(self, model):
+        state = self._framework_state_for('tensorflow')
+        if state.get('resumed'):
+            return
+        path = self._latest_checkpoint('tensorflow')
+        if path:
+            try:
+                info = self.checkpointer.load_checkpoint(model=model, checkpoint_path=path, framework='tensorflow')
+                self._record_checkpoint(info)
+            except Exception as exc:
+                print(f"[cumulus.auto] Failed to resume TensorFlow checkpoint: {exc}")
+        state['resumed'] = True
+
+    def _tf_after_batch(self, model, step):
+        state = self._framework_state_for('tensorflow')
+        state['step'] = step
+        if self._should_save(step, state.get('last_ts', 0.0)):
+            try:
+                info = self.checkpointer.save_checkpoint(model=model, epoch=0, step=step, framework='tensorflow', extra={'auto': True})
+                self._record_checkpoint(info)
+                state['last_ts'] = time.time()
+            except Exception as exc:
+                print(f"[cumulus.auto] Failed to save TensorFlow checkpoint: {exc}")
+        if should_pause():
+            try:
+                info = self.checkpointer.save_checkpoint(model=model, epoch=0, step=step, framework='tensorflow', extra={'auto': True, 'reason': 'pause'})
+                self._record_checkpoint(info)
+            except Exception as exc:
+                print(f"[cumulus.auto] Failed to save TensorFlow checkpoint during pause: {exc}")
+            model.stop_training = True
+            self._record_pause('tensorflow')
+
+    def _enable_xgboost(self):
+        if not self._module_available('xgboost'):
+            return
+        import xgboost as xgb
+        if getattr(xgb, "_cumulus_auto_ckpt", False):
+            return
+        manager = self
+
+        class _AutoXGBCallback(xgb.callback.TrainingCallback):
+            def __init__(self):
+                self._last_step = 0
+
+            def after_iteration(self, model, epoch, evals_log):
+                step = epoch + 1
+                self._last_step = step
+                manager._xgb_after_iteration(model, step)
+                if should_pause():
+                    manager._xgb_after_iteration(model, step, force=True)
+                    manager._record_pause('xgboost')
+                    return True
+                return False
+
+            def after_training(self, model):
+                manager._xgb_after_iteration(model, self._last_step, force=True)
+                return model
+
+        original_train = xgb.train
+
+        def train_wrapper(params, dtrain, num_boost_round=10, *args, **kwargs):
+            if not manager.enabled:
+                return original_train(params, dtrain, num_boost_round, *args, **kwargs)
+            callbacks = list(kwargs.get('callbacks') or [])
+            callbacks.append(_AutoXGBCallback())
+            kwargs['callbacks'] = callbacks
+            resume = manager._latest_checkpoint('xgboost')
+            if resume and 'xgb_model' not in kwargs:
+                kwargs['xgb_model'] = resume
+            booster = original_train(params, dtrain, num_boost_round, *args, **kwargs)
+            if manager.pause_requested('xgboost'):
+                manager._raise_pause()
+            return booster
+
+        xgb.train = train_wrapper
+        xgb._cumulus_auto_ckpt = True
+
+    def _xgb_after_iteration(self, booster, step, force=False):
+        state = self._framework_state_for('xgboost')
+        if step > state.get('step', 0):
+            state['step'] = step
+        if not force and not self._should_save(step, state.get('last_ts', 0.0)):
+            return
+        try:
+            info = self.checkpointer.save_checkpoint(model=booster, epoch=0, step=step, framework='xgboost', extra={'auto': True})
+            self._record_checkpoint(info)
+            state['last_ts'] = time.time()
+        except Exception as exc:
+            print(f"[cumulus.auto] Failed to save XGBoost checkpoint: {exc}")
+
+    def _enable_lightgbm(self):
+        if not self._module_available('lightgbm'):
+            return
+        import lightgbm as lgb
+        if getattr(lgb, "_cumulus_auto_ckpt", False):
+            return
+        manager = self
+
+        def auto_callback():
+            def _callback(env):
+                step = env.iteration + 1
+                manager._lgb_after_iteration(env.model, step)
+                if should_pause():
+                    manager._lgb_after_iteration(env.model, step, force=True)
+                    env.model.stop_training = True
+                    manager._record_pause('lightgbm')
+            _callback.order = 60
+            return _callback
+
+        original_train = lgb.train
+
+        def train_wrapper(params, train_set, num_boost_round=100, *args, **kwargs):
+            if not manager.enabled:
+                return original_train(params, train_set, num_boost_round, *args, **kwargs)
+            callbacks = list(kwargs.get('callbacks') or [])
+            callbacks.append(auto_callback())
+            kwargs['callbacks'] = callbacks
+            resume = manager._latest_checkpoint('lightgbm')
+            if resume and 'init_model' not in kwargs:
+                kwargs['init_model'] = resume
+            booster = original_train(params, train_set, num_boost_round, *args, **kwargs)
+            try:
+                manager._lgb_after_iteration(booster, booster.current_iteration(), force=True)
+            except Exception:
+                pass
+            if manager.pause_requested('lightgbm'):
+                manager._raise_pause()
+            return booster
+
+        lgb.train = train_wrapper
+        lgb._cumulus_auto_ckpt = True
+
+    def _lgb_after_iteration(self, booster, step, force=False):
+        state = self._framework_state_for('lightgbm')
+        if step > state.get('step', 0):
+            state['step'] = step
+        if not force and not self._should_save(step, state.get('last_ts', 0.0)):
+            return
+        try:
+            info = self.checkpointer.save_checkpoint(model=booster, epoch=0, step=step, framework='lightgbm', extra={'auto': True})
+            self._record_checkpoint(info)
+            state['last_ts'] = time.time()
+        except Exception as exc:
+            print(f"[cumulus.auto] Failed to save LightGBM checkpoint: {exc}")
+
+    def _enable_sklearn(self):
+        if not self._module_available('sklearn'):
+            return
+        from sklearn.base import BaseEstimator
+        if getattr(BaseEstimator, "_cumulus_auto_ckpt", False):
+            return
+        manager = self
+        original_fit = BaseEstimator.fit
+
+        def fit_wrapper(estimator_self, *args, **kwargs):
+            if manager.enabled:
+                manager._sklearn_before_fit(estimator_self)
+            result = original_fit(estimator_self, *args, **kwargs)
+            if manager.enabled:
+                manager._sklearn_after_fit(estimator_self)
+                if manager.pause_requested('sklearn'):
+                    manager._raise_pause()
+            return result
+
+        BaseEstimator.fit = fit_wrapper
+        BaseEstimator._cumulus_auto_ckpt = True
+
+    def _sklearn_before_fit(self, estimator):
+        state = self._framework_state_for('sklearn')
+        if state.get('resumed'):
+            return
+        path = self._latest_checkpoint('sklearn')
+        if path:
+            try:
+                info = self.checkpointer.load_checkpoint(checkpoint_path=path, framework='sklearn')
+                restored = info.get('state')
+                if restored is not None:
+                    if hasattr(restored, '__dict__'):
+                        estimator.__dict__.update(restored.__dict__)
+                    elif isinstance(restored, dict):
+                        estimator.__dict__.update(restored)
+                self._record_checkpoint(info)
+            except Exception as exc:
+                print(f"[cumulus.auto] Failed to resume sklearn checkpoint: {exc}")
+        state['resumed'] = True
+
+    def _sklearn_after_fit(self, estimator):
+        state = self._framework_state_for('sklearn')
+        step = state.get('step', 0) + 1
+        state['step'] = step
+        try:
+            info = self.checkpointer.save_checkpoint(model=estimator, epoch=0, step=step, framework='sklearn', extra={'auto': True})
+            self._record_checkpoint(info)
+            state['last_ts'] = time.time()
+        except Exception as exc:
+            print(f"[cumulus.auto] Failed to save sklearn checkpoint: {exc}")
+
+
+_AUTO_MANAGER: Optional[AutoCheckpointManager] = None
+
+
+def get_auto_checkpoint_manager() -> AutoCheckpointManager:
+    """Return the singleton auto-checkpoint manager, creating it if needed."""
+    global _AUTO_MANAGER
+    if _AUTO_MANAGER is None:
+        _AUTO_MANAGER = AutoCheckpointManager()
+    return _AUTO_MANAGER
+
+
+# Ensure auto-checkpointing hooks are registered on import.
+get_auto_checkpoint_manager()
 '''
     
     def _get_distributed_checkpointer(self) -> str:
@@ -1351,6 +1905,18 @@ def main():
         
         print("✅ Package execution completed successfully")
         
+    except runtime.CooperativePause as pause:
+        pause_info = runtime.get_last_checkpoint_info() or {}
+        pause_payload = {
+            'status': 'paused',
+            'reason': str(pause) or 'pause requested',
+            'checkpoint': pause_info
+        }
+        with open('result.json', 'w') as f:
+            json.dump(pause_payload, f, indent=2, default=str)
+        print("⏸️ Job paused cooperatively")
+        sys.exit(0)
+
     except Exception as e:
         error_info = {
             'error': str(e),

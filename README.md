@@ -59,7 +59,39 @@ result = client.run(
 print(f"Training result: {result}")
 ```
 
-#### **Framework-Agnostic Checkpointing**
+#### **Automatic Checkpointing (Zero Code Changes)**
+
+Every function executed through `client.run()` automatically imports the runtime helper and hooks into supported ML frameworks. Optimizer steps, Keras batches, XGBoost iterations, and LightGBM callbacks all trigger transparent checkpoints using the same distributed storage logic.
+
+```python
+def quick_train():
+    import torch
+    model = torch.nn.Linear(32, 8)
+    opt = torch.optim.Adam(model.parameters())
+    for step in range(200):
+        loss = model(torch.randn(64, 32)).pow(2).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+    return float(loss)
+
+result = client.run(
+    func=quick_train,
+    gpu_memory=0.2,
+    duration=600,
+    requirements=["torch"]
+)
+```
+
+**Control cadence** with environment variables (set on the worker or via submission arguments):
+
+| Variable                           | Default | Description                                       |
+| ---------------------------------- | ------- | ------------------------------------------------- |
+| `CUMULUS_AUTO_CHECKPOINT`          | `true`  | Disable auto mode by setting `false`.             |
+| `CUMULUS_CHECKPOINT_EVERY_STEPS`   | `100`   | Save every _N_ optimizer/training steps.          |
+| `CUMULUS_CHECKPOINT_EVERY_SECONDS` | `0`     | Minimum seconds between saves (0 disables timer). |
+
+**Cooperative pause**: the worker watches `control.json` under `/tmp/cumulus_jobs/<job_id>/`. Writing `{"pause": true}` (or calling `job.pause()`) forces the next checkpoint and returns a structured paused payload. Clearing the flag or calling `job.resume()` continues from the latest checkpoint.
+
+#### **Framework-Agnostic Checkpointing (Manual API)**
 
 ```python
 from cumulus.sdk import CumulusClient
@@ -115,6 +147,8 @@ Cumulus provides a unified checkpointing system that works across all major ML f
 - **scikit-learn** (`framework="sklearn"`)
 - **XGBoost** (`framework="xgboost"`)
 - **LightGBM** (`framework="lightgbm"`)
+
+Automatic checkpointing installs hooks for all of the above; manual calls remain available when you need explicit control.
 
 ### **Two-Tier Storage Architecture**
 
@@ -214,6 +248,7 @@ The test suite includes comprehensive tests for distributed execution and checkp
 - **Purpose**: End-to-end PyTorch training with checkpoint/resume workflow
 - **Features**:
   - Unified checkpointing API (`save_checkpoint()`, `load_checkpoint()`)
+  - Auto-checkpoint manager exercising cooperative pause/resume via the packaged runtime
   - Automatic S3 integration (if configured)
   - Training → checkpoint → resume → complete workflow
 - **Usage**: `python cumulus/tests/test_complete_nn.py`
@@ -226,6 +261,7 @@ The test suite includes comprehensive tests for distributed execution and checkp
   - Direct `DistributedCheckpointer` usage
   - Explicit S3 upload/download verification
   - Framework-specific adapter testing
+  - Validates sidecar metadata consumed by automatic resume hooks
 - **Usage**: `python cumulus/tests/test_unified_s3_complete.py`
 
 #### **Artifact Store Test** (`test_artifact_store.py`)
@@ -233,6 +269,13 @@ The test suite includes comprehensive tests for distributed execution and checkp
 - **Purpose**: Test artifact storage and retrieval
 - **Features**: Local and S3 artifact management
 - **Usage**: `python cumulus/tests/test_artifact_store.py`
+
+#### **Automatic Checkpoint Smoke Test** (`test_auto_checkpointing.py`)
+
+- **Purpose**: Verify that the AutoCheckpointManager saves checkpoints without manual calls
+- **Frameworks**: PyTorch, TensorFlow/Keras, scikit-learn, XGBoost, LightGBM
+- **Features**: Runs tiny jobs via `client.run()` and asserts checkpoint artifacts exist for each framework
+- **Usage**: `python cumulus/tests/test_auto_checkpointing.py`
 
 ### Running Tests
 
