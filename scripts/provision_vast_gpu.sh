@@ -17,6 +17,12 @@ PORT="8081"
 WORKERS="4"
 PYTHON_BIN="python3"
 
+# PyTorch install defaults (override via environment variables if needed)
+TORCH_VERSION="${TORCH_VERSION:-2.4.1}"
+TORCHVISION_VERSION="${TORCHVISION_VERSION:-0.19.1}"
+PYTORCH_CUDA_INDEX="${PYTORCH_CUDA_INDEX:-https://download.pytorch.org/whl/cu124}"
+PYTORCH_CPU_INDEX="${PYTORCH_CPU_INDEX:-https://download.pytorch.org/whl/cpu}"
+
 # Optional S3 config (will create ENV_FILE if provided)
 S3_BUCKET=""
 S3_REGION="us-east-1"
@@ -103,6 +109,57 @@ if ! command -v chronos_cli >/dev/null 2>&1 && [[ ! -x "/usr/local/bin/chronos_c
   exit 1
 fi
 
+install_torch_stack() {
+  local prefer_cuda=0
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    prefer_cuda=1
+  fi
+
+  if [[ ${prefer_cuda} -eq 1 ]]; then
+    echo "Attempting to install PyTorch ${TORCH_VERSION} (CUDA) from ${PYTORCH_CUDA_INDEX}..."
+    if pip install --progress-bar off --upgrade \
+      --index-url "${PYTORCH_CUDA_INDEX}" \
+      "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}"; then
+      return 0
+    fi
+    echo "PyTorch CUDA install failed; falling back to CPU wheel." >&2
+  else
+    echo "CUDA not detected or unavailable; installing CPU-only PyTorch build." >&2
+  fi
+
+  pip install --progress-bar off --upgrade \
+    --index-url "${PYTORCH_CPU_INDEX}" \
+    "torch==${TORCH_VERSION}+cpu" "torchvision==${TORCHVISION_VERSION}+cpu"
+}
+
+verify_torch_install() {
+  python - <<'PY'
+import importlib
+import sys
+
+def check(mod_name: str):
+    try:
+        module = importlib.import_module(mod_name)
+        return module
+    except Exception as exc:  # noqa: BLE001
+        print(f"❌ Failed to import {mod_name}: {exc}", file=sys.stderr)
+        raise
+
+torch = check("torch")
+check("torchvision")
+
+print(f"✅ torch version: {torch.__version__}")
+print(f"✅ CUDA available: {torch.cuda.is_available()}")
+
+if torch.cuda.is_available():
+    try:
+        torch.randn(1, device="cuda").cpu()
+    except Exception as exc:  # noqa: BLE001
+        print(f"❌ CUDA sanity check failed: {exc}", file=sys.stderr)
+        raise
+PY
+}
+
 echo "[4/8] Creating Python venv at ${VENV_DIR} and installing worker..."
 ${PYTHON_BIN} -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
@@ -114,8 +171,10 @@ if [[ -f "${INSTALL_DIR}/cumulus/worker/requirements.txt" ]]; then
   pip install -r "${INSTALL_DIR}/cumulus/worker/requirements.txt"
 fi
 
-# Optional GPU-enabled PyTorch (generic channels); user can adjust for specific CUDA
-pip install --upgrade torch torchvision || true
+pip install --upgrade boto3 botocore
+
+install_torch_stack
+verify_torch_install
 
 echo "[5/8] Writing environment (.env) if S3 info provided..."
 mkdir -p "${ENV_DIR}"

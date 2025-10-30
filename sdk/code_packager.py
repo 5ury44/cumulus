@@ -707,7 +707,8 @@ class AutoCheckpointManager:
 
         self.checkpointer = None
         self.distributed = False
-        self._torch_param_to_module = weakref.WeakKeyDictionary()
+        self._torch_param_to_module: Dict[int, weakref.ReferenceType] = {}
+        self._torch_param_finalizers: Dict[int, weakref.finalize] = {}
         self._torch_optimizer_state = weakref.WeakKeyDictionary()
         self.framework_state: Dict[str, Dict[str, Any]] = {}
         self._resume_cache: Dict[str, Optional[str]] = {}
@@ -824,7 +825,7 @@ class AutoCheckpointManager:
             result = original_add_module(self_module, name, module)
             if module is not None:
                 try:
-                    setattr(module, "_cumulus_parent", self_module)
+                    module.__dict__["_cumulus_parent"] = weakref.ref(self_module)
                 except Exception:
                     pass
             return result
@@ -833,7 +834,15 @@ class AutoCheckpointManager:
             result = original_register_parameter(self_module, name, param)
             if param is not None:
                 try:
-                    manager._torch_param_to_module[param] = self_module
+                    key = id(param)
+                    manager._torch_param_to_module[key] = weakref.ref(self_module)
+                    try:
+                        manager._torch_param_finalizers[key] = weakref.finalize(
+                            param,
+                            lambda k=key: manager._torch_param_to_module.pop(k, None)
+                        )
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             return result
@@ -876,14 +885,22 @@ class AutoCheckpointManager:
         modules = []
         for group in getattr(optimizer, 'param_groups', []):
             for param in group.get('params', []):
-                module = self._torch_param_to_module.get(param)
+                module_ref = self._torch_param_to_module.get(id(param))
+                if module_ref is None:
+                    continue
+                module = module_ref() if isinstance(module_ref, weakref.ReferenceType) else module_ref
                 if module is None:
                     continue
                 root = module
                 visited = set()
                 while hasattr(root, "_cumulus_parent") and getattr(root, "_cumulus_parent") is not None and root not in visited:
                     visited.add(root)
-                    root = getattr(root, "_cumulus_parent")
+                    parent = getattr(root, "_cumulus_parent")
+                    if isinstance(parent, weakref.ReferenceType):
+                        parent = parent()
+                    if parent is None:
+                        break
+                    root = parent
                 if root not in modules:
                     modules.append(root)
         if len(modules) == 1:
