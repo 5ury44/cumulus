@@ -1,0 +1,3 @@
+# Test job requirements
+numpy>=1.21.0
+requests>=2.25.0

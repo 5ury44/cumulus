@@ -1,0 +1,10 @@
+# Ignore generated files (they should be regenerated from .proto)
+# Uncomment if you want to commit generated code:
+# (Currently we generate on-demand)
+
+# Go generated files
+# *.pb.go
+
+# Python generated files  
+# *_pb2.py
+# *_pb2_grpc.py

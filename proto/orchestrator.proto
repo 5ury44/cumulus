@@ -1,0 +1,205 @@
+syntax = "proto3";
+
+package cumulus.orchestrator;
+
+option go_package = "github.com/cumulus/orchestrator/proto;orchestrator";
+
+// OrchestratorService handles job submission, monitoring, and management
+service OrchestratorService {
+    // Submit a job and stream progress/results back to client
+    rpc SubmitJob(JobSubmission) returns (stream JobEvent);
+    
+    // Get the current status of a job
+    rpc GetJobStatus(JobStatusRequest) returns (JobStatus);
+    
+    // Cancel a running or pending job
+    rpc CancelJob(JobCancelRequest) returns (CancelJobResponse);
+    
+    // List all available GPU workers (admin endpoint)
+    rpc ListWorkers(ListWorkersRequest) returns (WorkerList);
+    
+    // Health check endpoint
+    rpc HealthCheck(HealthCheckRequest) returns (HealthStatus);
+}
+
+// JobSubmission contains all information needed to execute a job
+message JobSubmission {
+    // ZIP file containing user code, requirements.txt, and job config
+    bytes code_package = 1;
+    
+    // Python package requirements (e.g., ["torch==2.0.0", "numpy"])
+    repeated string requirements = 2;
+    
+    // GPU memory allocation
+    // Fractional: 0.1-0.9 (time-sliced GPU sharing)
+    // Whole GPUs: 1, 2, 3, 4, 5, 6, 7, 8
+    float gpu_memory = 3;
+    
+    // Maximum execution duration in seconds (60-86400)
+    int32 duration = 4;
+}
+
+// JobEvent represents a state change or progress update for a job
+message JobEvent {
+    // Unique job identifier
+    string job_id = 1;
+    
+    // Current job state
+    JobState state = 2;
+    
+    // Human-readable message about the current state
+    string message = 3;
+    
+    // Final result (JSON-encoded) - only present when state=COMPLETED
+    bytes result = 4;
+    
+    // Progress indicator (0.0-1.0) - optional
+    float progress = 5;
+    
+    // Timestamp of this event
+    int64 timestamp = 6;
+}
+
+// JobState represents the lifecycle states of a job
+enum JobState {
+    // Job is being scheduled on a worker
+    SCHEDULING = 0;
+    
+    // Creating Chronos GPU partition on worker
+    CREATING_PARTITION = 1;
+    
+    // Job container is running
+    RUNNING = 2;
+    
+    // Job completed successfully
+    COMPLETED = 3;
+    
+    // Job failed with an error
+    FAILED = 4;
+    
+    // Job was cancelled by user
+    CANCELLED = 5;
+}
+
+// JobStatusRequest requests the current status of a job
+message JobStatusRequest {
+    string job_id = 1;
+}
+
+// JobStatus contains detailed information about a job
+message JobStatus {
+    string job_id = 1;
+    JobState state = 2;
+    string message = 3;
+    
+    // Worker node ID where job is/was running
+    string worker_id = 4;
+    
+    // Chronos partition ID
+    string partition_id = 5;
+    
+    // Docker service/container ID
+    string container_id = 6;
+    
+    // Timestamps
+    int64 created_at = 7;
+    int64 started_at = 8;
+    int64 completed_at = 9;
+    
+    // Error message if state=FAILED
+    string error = 10;
+}
+
+// JobCancelRequest requests cancellation of a job
+message JobCancelRequest {
+    string job_id = 1;
+}
+
+// CancelJobResponse confirms job cancellation
+message CancelJobResponse {
+    bool cancelled = 1;
+    string message = 2;
+}
+
+// ListWorkersRequest requests list of available workers
+message ListWorkersRequest {
+    // Optional: filter by worker status
+    string status_filter = 1;
+}
+
+// WorkerList contains information about all workers
+message WorkerList {
+    repeated WorkerInfo workers = 1;
+}
+
+// WorkerInfo describes a GPU worker node
+message WorkerInfo {
+    // Swarm node ID
+    string id = 1;
+    
+    // Hostname
+    string hostname = 2;
+    
+    // IP address for SSH access
+    string address = 3;
+    
+    // Worker status (ready, down, draining)
+    string status = 4;
+    
+    // GPU devices on this worker
+    repeated GPUDevice gpu_devices = 5;
+}
+
+// GPUDevice describes a single GPU
+message GPUDevice {
+    // Device index (0, 1, 2, ...)
+    int32 index = 1;
+    
+    // GPU name (e.g., "NVIDIA A100")
+    string name = 2;
+    
+    // Total memory in MB
+    int32 memory_mb = 3;
+    
+    // Total capacity (always 1.0 per physical GPU)
+    float total_capacity = 4;
+    
+    // Currently allocated amount (sum of active partitions)
+    float allocated_amount = 5;
+    
+    // Active partitions on this device
+    repeated PartitionInfo active_partitions = 6;
+}
+
+// PartitionInfo describes an active Chronos partition
+message PartitionInfo {
+    string partition_id = 1;
+    string job_id = 2;
+    float amount = 3;
+    int64 created_at = 4;
+    int64 expires_at = 5;
+}
+
+// HealthCheckRequest requests orchestrator health status
+message HealthCheckRequest {}
+
+// HealthStatus reports orchestrator health
+message HealthStatus {
+    // Overall status (healthy, degraded, unhealthy)
+    string status = 1;
+    
+    // Orchestrator version
+    string version = 2;
+    
+    // Number of active jobs
+    int32 active_jobs = 3;
+    
+    // Number of available workers
+    int32 available_workers = 4;
+    
+    // Swarm connection status
+    bool swarm_connected = 5;
+    
+    // Uptime in seconds
+    int64 uptime_seconds = 6;
+}

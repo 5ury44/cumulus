@@ -150,3 +150,6 @@ checkpoints/
 logs/
 temp/
 tmp/
+
+# Development environment
+.dev-instance

@@ -1,3 +1,0 @@
-[console_scripts]
-cumulus-cli = cumulus.cli:main
-cumulus-worker = cumulus.start_worker:main
