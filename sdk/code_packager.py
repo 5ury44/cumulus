@@ -212,6 +212,8 @@ import time
 import signal
 import importlib
 import importlib.util
+import functools
+import types
 import weakref
 try:
     import torch
@@ -711,6 +713,7 @@ class AutoCheckpointManager:
         self._resume_cache: Dict[str, Optional[str]] = {}
         self._paused_frameworks: Dict[str, bool] = {}
         self.last_checkpoint_info: Optional[Dict[str, Any]] = None
+        self.framework_status: Dict[str, str] = {}
 
         if not self.enabled:
             return
@@ -732,11 +735,15 @@ class AutoCheckpointManager:
             self._safe_enable('sklearn', self._enable_sklearn)
             self._safe_enable('xgboost', self._enable_xgboost)
             self._safe_enable('lightgbm', self._enable_lightgbm)
+        else:
+            for name in ('tensorflow', 'sklearn', 'xgboost', 'lightgbm'):
+                self.framework_status.setdefault(name, 'skipped (distributed checkpointing disabled)')
 
     def _safe_enable(self, name: str, func: Callable[[], None]):
         try:
             func()
         except Exception as exc:
+            self.framework_status[name] = f'error: {exc}'
             print(f"[cumulus.auto] Failed to enable {name} auto-checkpointing: {exc}")
 
     @staticmethod
@@ -774,6 +781,9 @@ class AutoCheckpointManager:
     def _raise_pause(self):
         raise CooperativePause("Pause requested by Cumulus scheduler")
 
+    def get_framework_status(self) -> Dict[str, str]:
+        return dict(self.framework_status)
+
     def _latest_checkpoint(self, framework: str) -> Optional[str]:
         if framework in self._resume_cache:
             return self._resume_cache[framework]
@@ -799,14 +809,16 @@ class AutoCheckpointManager:
 
     def _enable_torch(self):
         if torch is None:
+            self.framework_status['pytorch'] = 'skipped (torch not available)'
             return
         module_cls = torch.nn.Module
         if getattr(module_cls, "_cumulus_auto_ckpt", False):
+            self.framework_status['pytorch'] = 'ok'
             return
         manager = self
 
         original_add_module = module_cls.add_module
-        original_register_parameter = module_cls._register_parameter
+        original_register_parameter = module_cls.register_parameter
 
         def add_module_wrapper(self_module, name, module):
             result = original_add_module(self_module, name, module)
@@ -827,8 +839,9 @@ class AutoCheckpointManager:
             return result
 
         module_cls.add_module = add_module_wrapper
-        module_cls._register_parameter = register_parameter_wrapper
+        module_cls.register_parameter = register_parameter_wrapper
         module_cls._cumulus_auto_ckpt = True
+        self.framework_status['pytorch'] = 'ok'
 
         opt_cls = torch.optim.Optimizer
         if getattr(opt_cls, "_cumulus_auto_ckpt", False):
@@ -941,9 +954,11 @@ class AutoCheckpointManager:
 
     def _enable_tensorflow(self):
         if not self._module_available('tensorflow'):
+            self.framework_status['tensorflow'] = 'skipped (tensorflow not available)'
             return
         import tensorflow as tf
         if getattr(tf.keras.Model, "_cumulus_auto_ckpt", False):
+            self.framework_status['tensorflow'] = 'ok'
             return
         manager = self
 
@@ -975,6 +990,7 @@ class AutoCheckpointManager:
 
         tf.keras.Model.fit = fit_wrapper
         tf.keras.Model._cumulus_auto_ckpt = True
+        self.framework_status['tensorflow'] = 'ok'
 
     def _tf_before_train(self, model):
         state = self._framework_state_for('tensorflow')
@@ -1010,9 +1026,11 @@ class AutoCheckpointManager:
 
     def _enable_xgboost(self):
         if not self._module_available('xgboost'):
+            self.framework_status['xgboost'] = 'skipped (xgboost not available)'
             return
         import xgboost as xgb
         if getattr(xgb, "_cumulus_auto_ckpt", False):
+            self.framework_status['xgboost'] = 'ok'
             return
         manager = self
 
@@ -1052,6 +1070,7 @@ class AutoCheckpointManager:
 
         xgb.train = train_wrapper
         xgb._cumulus_auto_ckpt = True
+        self.framework_status['xgboost'] = 'ok'
 
     def _xgb_after_iteration(self, booster, step, force=False):
         state = self._framework_state_for('xgboost')
@@ -1068,9 +1087,11 @@ class AutoCheckpointManager:
 
     def _enable_lightgbm(self):
         if not self._module_available('lightgbm'):
+            self.framework_status['lightgbm'] = 'skipped (lightgbm not available)'
             return
         import lightgbm as lgb
         if getattr(lgb, "_cumulus_auto_ckpt", False):
+            self.framework_status['lightgbm'] = 'ok'
             return
         manager = self
 
@@ -1107,6 +1128,7 @@ class AutoCheckpointManager:
 
         lgb.train = train_wrapper
         lgb._cumulus_auto_ckpt = True
+        self.framework_status['lightgbm'] = 'ok'
 
     def _lgb_after_iteration(self, booster, step, force=False):
         state = self._framework_state_for('lightgbm')
@@ -1123,25 +1145,40 @@ class AutoCheckpointManager:
 
     def _enable_sklearn(self):
         if not self._module_available('sklearn'):
+            self.framework_status['sklearn'] = 'skipped (sklearn not available)'
             return
         from sklearn.base import BaseEstimator
         if getattr(BaseEstimator, "_cumulus_auto_ckpt", False):
+            self.framework_status['sklearn'] = 'ok'
             return
         manager = self
-        original_fit = BaseEstimator.fit
+        original_getattribute = BaseEstimator.__getattribute__
 
-        def fit_wrapper(estimator_self, *args, **kwargs):
-            if manager.enabled:
-                manager._sklearn_before_fit(estimator_self)
-            result = original_fit(estimator_self, *args, **kwargs)
-            if manager.enabled:
-                manager._sklearn_after_fit(estimator_self)
-                if manager.pause_requested('sklearn'):
-                    manager._raise_pause()
-            return result
+        def getattribute_wrapper(estimator_self, name):
+            attr = original_getattribute(estimator_self, name)
+            if name == 'fit' and callable(attr):
+                func = getattr(attr, '__func__', attr)
+                if getattr(func, '_cumulus_wrapped', False):
+                    return attr
 
-        BaseEstimator.fit = fit_wrapper
+                @functools.wraps(func)
+                def wrapped(*args, **kwargs):
+                    if manager.enabled:
+                        manager._sklearn_before_fit(estimator_self)
+                    result = func(estimator_self, *args, **kwargs)
+                    if manager.enabled:
+                        manager._sklearn_after_fit(estimator_self)
+                        if manager.pause_requested('sklearn'):
+                            manager._raise_pause()
+                    return result
+
+                setattr(func, '_cumulus_wrapped', True)
+                return types.MethodType(wrapped, estimator_self)
+            return attr
+
+        BaseEstimator.__getattribute__ = getattribute_wrapper
         BaseEstimator._cumulus_auto_ckpt = True
+        self.framework_status['sklearn'] = 'ok'
 
     def _sklearn_before_fit(self, estimator):
         state = self._framework_state_for('sklearn')
